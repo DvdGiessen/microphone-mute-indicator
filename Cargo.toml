@@ -1,0 +1,29 @@
+[package]
+name = "microphone-mute-indicator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.windows]
+version = "0.37.0"
+features = [
+    "alloc",
+    "implement",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
