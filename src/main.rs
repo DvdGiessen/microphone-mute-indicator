@@ -3,7 +3,7 @@
 
 #![windows_subsystem = "windows"]
 
-use std::cell::RefCell;
+use std::{cell::RefCell, thread::LocalKey};
 
 use windows::{
     core::*,
@@ -34,14 +34,14 @@ thread_local!(static AUDIO_ENDPOINT: RefCell<Option<IMMDevice>> = RefCell::new(N
 thread_local!(static AUDIO_ENDPOINT_VOLUME: RefCell<Option<IAudioEndpointVolume>> = RefCell::new(None));
 
 // Icons for active and muted states
-thread_local!(static ICON_ACTIVE: RefCell<HICON> = RefCell::new(Default::default()));
-thread_local!(static ICON_MUTED: RefCell<HICON> = RefCell::new(Default::default()));
+thread_local!(static ICON_ACTIVE: RefCell<Option<HICON>> = RefCell::new(None));
+thread_local!(static ICON_MUTED: RefCell<Option<HICON>> = RefCell::new(None));
 
 // Notify icon data registered to show in the notification tray
 thread_local!(static NOTIFY_ICON_DATA: RefCell<NOTIFYICONDATAW> = RefCell::new(Default::default()));
 
 // Context menu shown when right-clicking the notify icon
-thread_local!(static MENU: RefCell<HMENU> = RefCell::new(Default::default()));
+thread_local!(static MENU: RefCell<Option<HMENU>> = RefCell::new(None));
 
 // Callbacks for receiving notifications about changes
 thread_local!(static AUDIO_ENDPOINT_CALLBACK: RefCell<Option<IMMNotificationClient>> = RefCell::new(None));
@@ -91,60 +91,83 @@ impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback {
 // Audio initialization functions
 fn init_audio_endpoint() -> Result<()> {
     deinit_audio_endpoint();
-    let audio_endpoint: IMMDevice =
-        AUDIO_ENDPOINT_ENUMERATOR.with(|global| match &*global.borrow() {
-            Some(audio_endpoint_enumerator) => unsafe {
-                audio_endpoint_enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications)
-            },
-            _ => panic!(),
-        })?;
     AUDIO_ENDPOINT.with(|global| {
-        global.replace(Some(audio_endpoint));
-    });
-    Ok(())
+        global.replace(AUDIO_ENDPOINT_ENUMERATOR.with(|global| {
+            match &*global.borrow() {
+                Some(audio_endpoint_enumerator) => unsafe {
+                    audio_endpoint_enumerator.GetDefaultAudioEndpoint(eCapture, eCommunications)
+                }
+                .map_or_else(
+                    |error| {
+                        if error.code() == NTE_NOT_FOUND {
+                            Ok(None)
+                        } else {
+                            Err(error)
+                        }
+                    },
+                    |audio_endpoint| Ok(Some(audio_endpoint)),
+                ),
+                _ => Ok(None),
+            }
+        })?);
+        Ok(())
+    })
 }
 
 fn init_audio_endpoint_volume() -> Result<()> {
     deinit_audio_endpoint_volume();
-    let audio_endpoint_volume: IAudioEndpointVolume =
-        AUDIO_ENDPOINT.with(|global| match &*global.borrow() {
-            Some(audio_endpoint) => {
-                let mut audio_endpoint_volume_pointer = None;
-                unsafe {
-                    audio_endpoint.Activate(
-                        &IAudioEndpointVolume::IID,
-                        CLSCTX_ALL,
-                        std::ptr::null(),
-                        &mut audio_endpoint_volume_pointer as *mut _ as *mut _,
-                    )?;
+    AUDIO_ENDPOINT_VOLUME.with(|global_audio_endpoint_volume| {
+        global_audio_endpoint_volume.replace(AUDIO_ENDPOINT.with(|global_audio_endpoint| {
+            match &*global_audio_endpoint.borrow() {
+                Some(audio_endpoint) => {
+                    let mut audio_endpoint_volume_pointer: Option<IAudioEndpointVolume> = None;
+                    unsafe {
+                        audio_endpoint.Activate(
+                            &IAudioEndpointVolume::IID,
+                            CLSCTX_ALL,
+                            std::ptr::null(),
+                            &mut audio_endpoint_volume_pointer as *mut _ as *mut _,
+                        )
+                    }
+                    .map_or_else(
+                        |error| {
+                            if error.code() == E_NOINTERFACE {
+                                Ok(None)
+                            } else {
+                                Err(error)
+                            }
+                        },
+                        |_| match audio_endpoint_volume_pointer {
+                            Some(audio_endpoint_volume) => AUDIO_ENDPOINT_VOLUME_CALLBACK
+                                .with(|audio_endpoint_volume_callback| unsafe {
+                                    audio_endpoint_volume.RegisterControlChangeNotify(
+                                        &*audio_endpoint_volume_callback.borrow(),
+                                    )
+                                })
+                                .map(|_| Some(audio_endpoint_volume)),
+                            _ => Ok(None),
+                        },
+                    )
                 }
-                audio_endpoint_volume_pointer.ok_or(Error::OK)
+                _ => Ok(None),
             }
-            _ => panic!(),
-        })?;
-    AUDIO_ENDPOINT_VOLUME_CALLBACK.with(|audio_endpoint_volume_callback| unsafe {
-        audio_endpoint_volume.RegisterControlChangeNotify(&*audio_endpoint_volume_callback.borrow())
-    })?;
-    AUDIO_ENDPOINT_VOLUME.with(|global| {
-        global.replace(Some(audio_endpoint_volume));
-    });
-    Ok(())
+        })?);
+        Ok(())
+    })
 }
 
 // Audio deinitialization functions
 fn deinit_audio_endpoint_volume() {
-    AUDIO_ENDPOINT_VOLUME.with(|global| {
-        match &*global.borrow() {
-            Some(audio_endpoint_volume) => {
-                AUDIO_ENDPOINT_VOLUME_CALLBACK.with(|audio_endpoint_volume_callback| unsafe {
+    AUDIO_ENDPOINT_VOLUME.with(|global| match global.replace(None) {
+        Some(audio_endpoint_volume) => {
+            AUDIO_ENDPOINT_VOLUME_CALLBACK
+                .with(|audio_endpoint_volume_callback| unsafe {
                     audio_endpoint_volume
                         .UnregisterControlChangeNotify(&*audio_endpoint_volume_callback.borrow())
-                        .unwrap()
-                });
-            }
-            _ => (),
+                })
+                .ok();
         }
-        drop(global.replace(None));
+        _ => (),
     });
 }
 
@@ -164,19 +187,76 @@ fn toggle_mute() -> Result<()> {
                 std::ptr::null(),
             )
         },
-        _ => panic!(),
+        _ => Ok(()),
     })
+}
+
+// Load the icons to use from the icon file
+fn load_icons(instance: HINSTANCE) -> Result<()> {
+    // Load the icons
+    let icon_active = unsafe {
+        ExtractIconW(
+            instance,
+            "%SystemRoot%\\System32\\SndVolSSO.dll",
+            141u32.wrapping_neg(),
+        )
+    };
+    let icon_muted = unsafe {
+        ExtractIconW(
+            instance,
+            "%SystemRoot%\\System32\\SndVolSSO.dll",
+            140u32.wrapping_neg(),
+        )
+    };
+
+    assert!(!icon_active.is_invalid(), "Active icon is not valid.");
+    assert!(!icon_muted.is_invalid(), "Muted icon is not valid.");
+
+    // Replace currently loaded icons
+    ICON_ACTIVE.with(|global| match global.replace(Some(icon_active)) {
+        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        _ => Ok(()),
+    })?;
+    ICON_MUTED.with(|global| match global.replace(Some(icon_muted)) {
+        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        _ => Ok(()),
+    })?;
+    Ok(())
 }
 
 // Retrieves the microphone status and updates the icon and tooltip
 fn update_icon_data() -> Result<()> {
-    AUDIO_ENDPOINT.with(
-        |global_audio_endpoint| match &*global_audio_endpoint.borrow() {
-            Some(audio_endpoint) => AUDIO_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
-                Some(audio_endpoint_volume) => NOTIFY_ICON_DATA.with(|global_notify_icon_data| {
-                    let notify_icon_data = &mut *global_notify_icon_data.borrow_mut();
-                    let tooltip_text: Vec<u16>;
-                    let mut device_name = unsafe {
+    NOTIFY_ICON_DATA.with(|global_notify_icon_data| {
+        let notify_icon_data = &mut *global_notify_icon_data.borrow_mut();
+        let max_text_len = notify_icon_data.szTip.len() - 1;
+        let mut set_icon_data =
+            |icon: &'static LocalKey<RefCell<Option<HICON>>>,
+             text: &mut dyn Iterator<Item = u16>| {
+                icon.with(|icon_ref| match *icon_ref.borrow() {
+                    Some(icon_id) if !icon_id.is_invalid() => {
+                        notify_icon_data.hIcon = icon_id;
+                        notify_icon_data.uFlags |= NIF_ICON;
+                    }
+                    _ => {
+                        notify_icon_data.hIcon = Default::default();
+                        notify_icon_data.uFlags &= !NIF_ICON;
+                    }
+                });
+                notify_icon_data
+                    .szTip
+                    .iter_mut()
+                    .zip(text.take(max_text_len).chain(std::iter::repeat(0)))
+                    .for_each(|(ptr, chr)| *ptr = chr);
+                if notify_icon_data.szTip[0] == 0 {
+                    notify_icon_data.uFlags &= !(NIF_TIP | NIF_SHOWTIP);
+                } else {
+                    notify_icon_data.uFlags |= NIF_TIP | NIF_SHOWTIP;
+                }
+            };
+        AUDIO_ENDPOINT.with(
+            |global_audio_endpoint| match &*global_audio_endpoint.borrow() {
+                Some(audio_endpoint) => {
+                    let mut device_name_buffer = unsafe {
                         audio_endpoint
                             .OpenPropertyStore(STGM_READ)?
                             .GetValue(&PKEY_Device_FriendlyName)?
@@ -186,47 +266,68 @@ fn update_icon_data() -> Result<()> {
                             .pwszVal
                             .0
                     };
-                    if unsafe { audio_endpoint_volume.GetMute() }?.into() {
-                        ICON_MUTED.with(|icon_muted| notify_icon_data.hIcon = *icon_muted.borrow());
-                        tooltip_text = ": muted".encode_utf16().collect();
-                    } else {
-                        ICON_ACTIVE
-                            .with(|icon_active| notify_icon_data.hIcon = *icon_active.borrow());
-                        tooltip_text = format!(
-                            ": {:.0}%",
-                            100f32 * unsafe { audio_endpoint_volume.GetMasterVolumeLevelScalar() }?
-                        )
-                        .encode_utf16()
-                        .collect();
-                    }
-                    notify_icon_data
-                        .szTip
-                        .iter_mut()
-                        .zip(
-                            std::iter::from_fn(move || {
-                                let chr;
-                                unsafe {
-                                    chr = if *device_name != 0 {
-                                        Some(*device_name)
-                                    } else {
-                                        None
-                                    };
-                                    device_name = device_name.add(1);
-                                }
-                                chr
-                            })
-                            .chain(tooltip_text)
-                            .chain(std::iter::repeat(0)),
-                        )
-                        .for_each(|(ptr, chr)| *ptr = chr);
+                    let device_name_prefix = std::iter::from_fn(move || {
+                        let chr;
+                        unsafe {
+                            chr = if *device_name_buffer != 0 {
+                                Some(*device_name_buffer)
+                            } else {
+                                None
+                            };
+                            device_name_buffer = device_name_buffer.add(1);
+                        }
+                        chr
+                    })
+                    .chain(": ".encode_utf16());
+                    AUDIO_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
+                        Some(audio_endpoint_volume) => {
+                            let volume = if unsafe { audio_endpoint_volume.GetMute() }?.into() {
+                                None
+                            } else {
+                                Some(format!(
+                                    "{:.0}%",
+                                    100f32
+                                        * unsafe {
+                                            audio_endpoint_volume.GetMasterVolumeLevelScalar()
+                                        }?
+                                ))
+                            };
 
+                            set_icon_data(
+                                if volume.is_some() {
+                                    &ICON_ACTIVE
+                                } else {
+                                    &ICON_MUTED
+                                },
+                                &mut device_name_prefix.chain(
+                                    match volume {
+                                        Some(volume_text) => volume_text,
+                                        _ => "muted".to_owned(),
+                                    }
+                                    .encode_utf16(),
+                                ),
+                            );
+                            Ok(())
+                        }
+                        _ => {
+                            set_icon_data(
+                                &ICON_MUTED,
+                                &mut device_name_prefix.chain("volume unknown!".encode_utf16()),
+                            );
+                            Ok(())
+                        }
+                    })
+                }
+                _ => {
+                    set_icon_data(
+                        &ICON_MUTED,
+                        &mut "No default communications audio input found!".encode_utf16(),
+                    );
                     Ok(())
-                }),
-                _ => panic!(),
-            }),
-            _ => panic!(),
-        },
-    )
+                }
+            },
+        )
+    })
 }
 
 // Add the notify icon for when it does not already exists
@@ -254,6 +355,46 @@ fn update_notify_icon() -> Result<()> {
     })
 }
 
+// Update the menu
+fn update_menu() -> Result<()> {
+    MENU.with(|global| {
+        let menu = unsafe { CreatePopupMenu() }?;
+        unsafe {
+            AppendMenuW(menu, MF_ENABLED | MF_STRING, IDM_EXIT, "E&xit\0").ok()?;
+        }
+        match global.replace(Some(menu)) {
+            Some(old_menu) => unsafe { DestroyMenu(old_menu).ok() },
+            _ => Ok(()),
+        }
+    })
+}
+
+// Show the menu at the given coordinates
+fn show_menu(window: HWND, x: i32, y: i32) -> Result<()> {
+    update_menu()?;
+    MENU.with(|menu| {
+        unsafe {
+            // Set our window as foreground so the menu disappears when focus is lost
+            SetForegroundWindow(window);
+            TrackPopupMenuEx(
+                *menu.borrow(),
+                (TPM_RIGHTBUTTON
+                    | if GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 {
+                        TPM_RIGHTALIGN
+                    } else {
+                        TPM_LEFTALIGN
+                    })
+                .0,
+                x,
+                y,
+                window,
+                std::ptr::null(),
+            )
+            .ok()
+        }
+    })
+}
+
 // Callback for message pump
 extern "system" fn window_callback(
     window: HWND,
@@ -271,48 +412,40 @@ extern "system" fn window_callback(
             });
             LRESULT(0)
         }
-        WM_APP_NOTIFYICON => {
-            match lparam.0 as u32 & 0xffff {
-                NIN_SELECT => {
-                    toggle_mute().unwrap();
-                    update_notify_icon().unwrap();
-                }
-                WM_CONTEXTMENU => {
-                    MENU.with(|menu| {
-                        unsafe {
-                            // Set our window as foreground so the menu disappears when focus is lost
-                            SetForegroundWindow(window);
-                            TrackPopupMenuEx(
-                                *menu.borrow(),
-                                (TPM_RIGHTBUTTON
-                                    | if GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 {
-                                        TPM_RIGHTALIGN
-                                    } else {
-                                        TPM_LEFTALIGN
-                                    })
-                                .0,
-                                wparam.0 as i32 & 0xffff,
-                                (wparam.0 as i32 >> 16) & 0xffff,
-                                window,
-                                std::ptr::null(),
-                            );
-                        }
-                    });
-                }
-                _ => (),
-            }
+        WM_DPICHANGED => {
+            let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+            assert!(instance.0 != 0);
+            load_icons(instance).unwrap();
+            update_notify_icon().ok();
             LRESULT(0)
         }
+        WM_APP_NOTIFYICON => match lparam.0 as u32 & 0xffff {
+            NIN_SELECT => {
+                toggle_mute().ok();
+                LRESULT(0)
+            }
+            WM_CONTEXTMENU => {
+                show_menu(
+                    window,
+                    wparam.0 as i32 & 0xffff,
+                    (wparam.0 as i32 >> 16) & 0xffff,
+                )
+                .unwrap();
+                LRESULT(0)
+            }
+            _ => LRESULT(0),
+        },
         WM_APP_CALLBACK_ENDPOINT => {
             // Audio endpoint has changed
-            init_audio_endpoint().unwrap();
-            init_audio_endpoint_volume().unwrap();
-            update_notify_icon().unwrap();
+            init_audio_endpoint()
+                .and_then(|_| init_audio_endpoint_volume())
+                .ok();
+            update_notify_icon().ok();
             LRESULT(0)
         }
         WM_APP_CALLBACK_VOLUME => {
             // Audio endpoint volume/mute has changed
-            update_notify_icon().unwrap();
+            update_notify_icon().ok();
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -338,7 +471,10 @@ extern "system" fn window_callback(
         }
         _ => WM_TASKBAR_CREATED.with(|wm_taskbar_created| {
             if wm_taskbar_created.borrow().map_or(false, |m| m == message) {
-                add_notify_icon().unwrap();
+                // We also get TaskbarCreated messages when the DPI is changed,
+                // but in that case the icon still exists, so if adding it fails
+                // we try updating it instead
+                add_notify_icon().or_else(|_| update_notify_icon()).unwrap();
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -386,41 +522,6 @@ fn main() -> Result<()> {
     };
     assert!(window.0 != 0);
 
-    // Create a menu
-    let menu = unsafe { CreatePopupMenu() }?;
-    unsafe {
-        AppendMenuW(menu, MF_ENABLED | MF_STRING, IDM_EXIT, "E&xit\0").ok()?;
-    }
-    MENU.with(|global| {
-        global.replace(menu);
-    });
-
-    // Load the icons
-    let icon_active = unsafe {
-        ExtractIconW(
-            instance,
-            "%SystemRoot%\\System32\\SndVolSSO.dll",
-            141u32.wrapping_neg(),
-        )
-    };
-    let icon_muted = unsafe {
-        ExtractIconW(
-            instance,
-            "%SystemRoot%\\System32\\SndVolSSO.dll",
-            140u32.wrapping_neg(),
-        )
-    };
-
-    assert!(!icon_active.is_invalid(), "Active icon is not valid.");
-    assert!(!icon_muted.is_invalid(), "Muted icon is not valid.");
-
-    ICON_ACTIVE.with(|global| {
-        global.replace(icon_active);
-    });
-    ICON_MUTED.with(|global| {
-        global.replace(icon_muted);
-    });
-
     // Initialize COM runtime
     unsafe {
         CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED)?;
@@ -452,7 +553,7 @@ fn main() -> Result<()> {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: window,
         uID: 0,
-        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP,
+        uFlags: NIF_MESSAGE,
         uCallbackMessage: WM_APP_NOTIFYICON,
         Anonymous: NOTIFYICONDATAW_0 {
             uVersion: NOTIFYICON_VERSION_4,
@@ -463,6 +564,7 @@ fn main() -> Result<()> {
         global.replace(notify_icon_data);
     });
 
+    load_icons(instance)?;
     add_notify_icon()?;
 
     // Message pump
@@ -480,18 +582,15 @@ fn main() -> Result<()> {
 
     // Release the COM objects
     deinit_audio_endpoint();
-    AUDIO_ENDPOINT_ENUMERATOR.with(|global| {
-        match &*global.borrow() {
-            Some(audio_endpoint_enumerator) => {
-                AUDIO_ENDPOINT_CALLBACK.with(|audio_endpoint_callback| unsafe {
-                    audio_endpoint_enumerator
-                        .UnregisterEndpointNotificationCallback(&*audio_endpoint_callback.borrow())
-                        .unwrap()
-                });
-            }
-            _ => (),
+    AUDIO_ENDPOINT_ENUMERATOR.with(|global| match global.replace(None) {
+        Some(audio_endpoint_enumerator) => {
+            AUDIO_ENDPOINT_CALLBACK.with(|audio_endpoint_callback| unsafe {
+                audio_endpoint_enumerator
+                    .UnregisterEndpointNotificationCallback(&*audio_endpoint_callback.borrow())
+                    .unwrap()
+            });
         }
-        drop(global.replace(None));
+        _ => (),
     });
 
     // Deinitialize COM runtime
@@ -500,19 +599,26 @@ fn main() -> Result<()> {
     }
 
     // Deallocate icons
-    unsafe {
-        DestroyIcon(icon_active).ok()?;
-        DestroyIcon(icon_muted).ok()?;
-    }
+    ICON_ACTIVE.with(|global| match global.replace(None) {
+        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        _ => Ok(()),
+    })?;
+    ICON_MUTED.with(|global| match global.replace(None) {
+        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        _ => Ok(()),
+    })?;
 
     // Destroy the menu
-    unsafe {
-        DestroyMenu(menu);
-    }
+    MENU.with(|global| match global.replace(None) {
+        Some(menu) => unsafe {
+            DestroyMenu(menu).unwrap();
+        },
+        _ => (),
+    });
 
     // Unregister the window class
     unsafe {
-        UnregisterClassW("MicrophoneMuteIndicator", instance).ok()?;
+        UnregisterClassW(window_class_name, instance).ok()?;
     }
 
     if message.wParam.0 == 0 {
