@@ -234,7 +234,7 @@ fn init_audio_endpoint() -> Result<()> {
                     }
                     .map_or_else(
                         |error| {
-                            if error.code() == NTE_NOT_FOUND {
+                            if error.win32_error() == Some(ERROR_NOT_FOUND) {
                                 Ok(None)
                             } else {
                                 Err(error)
