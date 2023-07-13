@@ -42,3 +42,7 @@ program, version of Windows, steps to reproduce) as possible.
 
 Microphone Mute Indicator is freely distributable under the terms of the MIT
 license.
+
+## Alternatives
+
+- [MicStatus](https://github.com/alandau/MicStatus) by Alex Landau
