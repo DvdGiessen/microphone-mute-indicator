@@ -9,16 +9,33 @@ use std::{cell::RefCell, ffi::c_void, thread::LocalKey};
 
 use windows::{
     core::*,
-    Win32::Foundation::*,
-    Win32::Media::Audio::Endpoints::*,
-    Win32::Media::Audio::*,
-    Win32::System::Com::*,
-    Win32::UI::WindowsAndMessaging::*,
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
-        System::Com::StructuredStorage::STGM_READ, UI::Shell::*,
+        Foundation::*,
+        Graphics::{
+            Gdi,
+            Gdi::*
+        },
+        Media::Audio::{
+            *,
+            Endpoints::*,
+        },
+        System::{
+            Com::{
+                *,
+                StructuredStorage::STGM_READ,
+            },
+            LibraryLoader::GetModuleHandleW,
+            Registry::*,
+        },
+        UI::{
+            Shell::{
+                *,
+                PropertiesSystem::PROPERTYKEY
+            },
+            WindowsAndMessaging::*,
+        },
     },
-    Win32::{System::LibraryLoader::GetModuleHandleW, UI::Shell::PropertiesSystem::PROPERTYKEY},
 };
 
 const WM_APP_NOTIFYICON: u32 = WM_APP + 1;
@@ -46,7 +63,9 @@ thread_local!(static AUDIO_DEFAULT_ENDPOINT_VOLUME: RefCell<Option<IAudioEndpoin
 
 // Icons for active and muted states
 thread_local!(static ICON_ACTIVE: RefCell<Option<HICON>> = RefCell::new(None));
+thread_local!(static ICON_ACTIVE_INVERTED: RefCell<Option<HICON>> = RefCell::new(None));
 thread_local!(static ICON_MUTED: RefCell<Option<HICON>> = RefCell::new(None));
+thread_local!(static ICON_MUTED_INVERTED: RefCell<Option<HICON>> = RefCell::new(None));
 
 // Notify icon data registered to show in the notification tray
 thread_local!(static NOTIFY_ICON_DATA: RefCell<NOTIFYICONDATAW> = RefCell::new(Default::default()));
@@ -353,6 +372,92 @@ fn set_default_audio_capture_device(device_id: PWSTR) -> Result<()> {
     })
 }
 
+// Create a copy of the icon with its colors inverted
+fn invert_icon(icon: HICON) -> Result<HICON> {
+    unsafe {
+        // Get info about the icon
+        let mut icon_info: ICONINFO = Default::default();
+        GetIconInfo(icon, &mut icon_info).ok()?;
+
+        // Check we have a color icon we can invert
+        if icon_info.hbmColor.is_invalid() {
+            return Ok(icon)
+        }
+
+        // Retrieve the icon bitmap from the handle
+        let mut icon_bitmap: BITMAP = Default::default();
+        assert!(
+            Gdi::GetObjectW(
+                icon_info.hbmColor,
+                std::mem::size_of::<BITMAP>() as i32,
+                &mut icon_bitmap as *mut _ as *mut _
+            ) as usize == std::mem::size_of::<BITMAP>(),
+            "Failed to read icon bitmap"
+        );
+
+        // Create device context for accessing the icon
+        let icon_dc: CreatedHDC = CreateCompatibleDC(None);
+        let icon_dc_prevobj = Gdi::SelectObject(icon_dc, icon_info.hbmColor);
+
+        // Create new 32-bit RGBA bitmap to contain inverted icon
+        let mut inverted_info: BITMAPV5HEADER = Default::default();
+        inverted_info.bV5Size = std::mem::size_of::<BITMAPV5HEADER>() as u32;
+        inverted_info.bV5Width = icon_bitmap.bmWidth;
+        inverted_info.bV5Height = icon_bitmap.bmHeight;
+        inverted_info.bV5Planes = 1;
+        inverted_info.bV5BitCount = 32;
+        inverted_info.bV5Compression = BI_BITFIELDS as u32;
+        inverted_info.bV5RedMask = 0x00ff0000;
+        inverted_info.bV5GreenMask = 0x0000ff00;
+        inverted_info.bV5BlueMask  = 0x000000ff;
+        inverted_info.bV5AlphaMask = 0xff000000;
+
+        // Pointer to the RGBA pixels of the inverted bitmap
+        let mut inverted_pixels: *mut u32 = std::ptr::null_mut();
+
+        // Create inverted bitmap using a new device context
+        let inverted_dc: CreatedHDC = CreateCompatibleDC(None);
+        let inverted_bitmap = CreateDIBSection(
+            inverted_dc,
+            &mut inverted_info as *mut _ as *const BITMAPINFO,
+            DIB_RGB_COLORS,
+            &mut inverted_pixels as *mut _ as *mut *mut c_void,
+            None,
+            0
+        )?;
+        let inverted_dc_prevobj = Gdi::SelectObject(inverted_dc, inverted_bitmap);
+
+        // Create a copy of the icon by blitting from the DC with the original to the new one
+        BitBlt(
+            inverted_dc,
+            0, 0,
+            icon_bitmap.bmWidth, icon_bitmap.bmHeight,
+            icon_dc,
+            0, 0,
+            SRCCOPY
+        ).ok()?;
+
+        // Remove DC for original icon since we don't need it after blitting is done
+        Gdi::SelectObject(icon_dc, icon_dc_prevobj);
+        DeleteDC(icon_dc).ok()?;
+
+        // Invert the pixels which we can now access via the pointer
+        for i in 0..(icon_bitmap.bmWidth * icon_bitmap.bmHeight) as isize {
+            *(inverted_pixels.offset(i)) ^= 0x00ffffff;
+        }
+
+        // Create a new icon with our modified color data
+        icon_info.hbmColor = inverted_bitmap;
+        let inverted = CreateIconIndirect(&icon_info)?;
+
+        // Remove DC for inverted icon since we have now created it
+        Gdi::SelectObject(inverted_dc, inverted_dc_prevobj);
+        DeleteDC(inverted_dc).ok()?;
+
+        Ok(inverted)
+    }
+}
+
 // Load the icons to use from the icon file
 fn load_icons(instance: HINSTANCE) -> Result<()> {
     // Load the icons
@@ -363,6 +468,7 @@ fn load_icons(instance: HINSTANCE) -> Result<()> {
             141u32.wrapping_neg(),
         )
     };
+    let icon_active_inverted = invert_icon(icon_active)?;
     let icon_muted = unsafe {
         ExtractIconW(
             instance,
@@ -370,12 +476,19 @@ fn load_icons(instance: HINSTANCE) -> Result<()> {
             140u32.wrapping_neg(),
         )
     };
+    let icon_muted_inverted = invert_icon(icon_muted)?;
 
     assert!(!icon_active.is_invalid(), "Active icon is not valid.");
+    assert!(!icon_active_inverted.is_invalid(), "Active inverted icon is not valid.");
     assert!(!icon_muted.is_invalid(), "Muted icon is not valid.");
+    assert!(!icon_muted_inverted.is_invalid(), "Muted inverted icon is not valid.");
 
     // Replace currently loaded icons
     ICON_ACTIVE.with(|global| match global.replace(Some(icon_active)) {
+        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        _ => Ok(()),
+    })?;
+    ICON_ACTIVE_INVERTED.with(|global| match global.replace(Some(icon_active_inverted)) {
         Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
         _ => Ok(()),
     })?;
@@ -383,11 +496,42 @@ fn load_icons(instance: HINSTANCE) -> Result<()> {
         Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
         _ => Ok(()),
     })?;
+    ICON_MUTED_INVERTED.with(|global| match global.replace(Some(icon_muted_inverted)) {
+        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        _ => Ok(()),
+    })?;
+
     Ok(())
+}
+
+// Function determining whether we should use the inverted icon by checking if Windows is in dark or light mode
+fn should_use_inverted_icon() -> bool {
+    let mut buffer = [0u8; 4];
+    let mut size: u32 = 4;
+    if unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            "AppsUseLightTheme",
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr() as *mut c_void,
+            &mut size as *mut u32,
+        ).ok()
+    }.is_err() {
+        return false;
+    }
+    assert!(size == 4, "Invalid size for DWORD.");
+    return i32::from_le_bytes(buffer) != 0;
 }
 
 // Retrieves the microphone status and updates the icon and tooltip
 fn update_icon_data() -> Result<()> {
+    let (icon_active, icon_muted) = if should_use_inverted_icon() {
+        (&ICON_ACTIVE_INVERTED, &ICON_MUTED_INVERTED)
+    } else {
+        (&ICON_ACTIVE, &ICON_MUTED)
+    };
     NOTIFY_ICON_DATA.with(|global_notify_icon_data| {
         let notify_icon_data = &mut *global_notify_icon_data.borrow_mut();
         let max_text_len = notify_icon_data.szTip.len() - 1;
@@ -457,9 +601,9 @@ fn update_icon_data() -> Result<()> {
 
                             set_icon_data(
                                 if volume.is_some() {
-                                    &ICON_ACTIVE
+                                    icon_active
                                 } else {
-                                    &ICON_MUTED
+                                    icon_muted
                                 },
                                 &mut device_name_prefix.chain(
                                     match volume {
@@ -473,7 +617,7 @@ fn update_icon_data() -> Result<()> {
                         }
                         _ => {
                             set_icon_data(
-                                &ICON_MUTED,
+                                icon_muted,
                                 &mut device_name_prefix.chain(LABEL_VOLUME_UNKNOWN.encode_utf16()),
                             );
                             Ok(())
@@ -481,7 +625,7 @@ fn update_icon_data() -> Result<()> {
                     })
                 }
                 _ => {
-                    set_icon_data(&ICON_MUTED, &mut LABEL_NO_DEFAULT_DEVICE.encode_utf16());
+                    set_icon_data(icon_muted, &mut LABEL_NO_DEFAULT_DEVICE.encode_utf16());
                     Ok(())
                 }
             }
@@ -760,6 +904,10 @@ extern "system" fn window_callback(
             let instance = unsafe { GetModuleHandleW(None) }.unwrap();
             assert!(instance.0 != 0);
             load_icons(instance).unwrap();
+            update_notify_icon().ok();
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
             update_notify_icon().ok();
             LRESULT(0)
         }
