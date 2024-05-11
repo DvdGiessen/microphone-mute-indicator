@@ -3,8 +3,6 @@
 
 #![windows_subsystem = "windows"]
 
-use core::fmt;
-use std::mem;
 use std::{cell::RefCell, ffi::c_void, thread::LocalKey};
 
 use windows::{
@@ -12,27 +10,11 @@ use windows::{
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::*,
-        Graphics::{
-            Gdi,
-            Gdi::*
-        },
-        Media::Audio::{
-            *,
-            Endpoints::*,
-        },
-        System::{
-            Com::{
-                *,
-                StructuredStorage::STGM_READ,
-            },
-            LibraryLoader::GetModuleHandleW,
-            Registry::*,
-        },
+        Graphics::{Gdi, Gdi::*},
+        Media::Audio::{Endpoints::*, *},
+        System::{Com::*, LibraryLoader::GetModuleHandleW, Registry::*},
         UI::{
-            Shell::{
-                *,
-                PropertiesSystem::PROPERTYKEY
-            },
+            Shell::{PropertiesSystem::PROPERTYKEY, *},
             WindowsAndMessaging::*,
         },
     },
@@ -46,53 +28,57 @@ const IDM_EXIT: u16 = 0u16.wrapping_sub(1);
 const IDM_SEPARATOR: u16 = 0u16.wrapping_sub(2);
 const IDM_NO_ENDPOINTS: u16 = 0u16.wrapping_sub(3);
 
-const LABEL_EXIT: &str = "E&xit\0";
-const LABEL_NO_CAPTURE_DEVICES: &str = "No audio capture devices found\0";
+const LABEL_EXIT: PCWSTR = w!("E&xit\0");
+const LABEL_NO_CAPTURE_DEVICES: PCWSTR = w!("No audio capture devices found\0");
 const LABEL_NO_DEFAULT_DEVICE: &str = "No default communications audio capture device found!";
 const LABEL_MUTED: &str = "muted";
 const LABEL_VOLUME_UNKNOWN: &str = "volume unknown";
 
 // Message received when the taskbar is (re)created
-thread_local!(static WM_TASKBAR_CREATED: RefCell<Option<u32>> = RefCell::new(None));
+thread_local!(static WM_TASKBAR_CREATED: RefCell<Option<u32>> = const { RefCell::new(None) });
 
 // COM objects for interacting with Windows Audio
-thread_local!(static AUDIO_POLICY_CONFIG: RefCell<Option<IPolicyConfig>> = RefCell::new(None));
-thread_local!(static AUDIO_ENDPOINT_ENUMERATOR: RefCell<Option<IMMDeviceEnumerator>> = RefCell::new(None));
-thread_local!(static AUDIO_DEFAULT_ENDPOINT: RefCell<Option<IMMDevice>> = RefCell::new(None));
-thread_local!(static AUDIO_DEFAULT_ENDPOINT_VOLUME: RefCell<Option<IAudioEndpointVolume>> = RefCell::new(None));
+thread_local!(static AUDIO_POLICY_CONFIG: RefCell<Option<IPolicyConfig>> = const { RefCell::new(None) });
+thread_local!(static AUDIO_ENDPOINT_ENUMERATOR: RefCell<Option<IMMDeviceEnumerator>> = const { RefCell::new(None) });
+thread_local!(static AUDIO_DEFAULT_ENDPOINT: RefCell<Option<IMMDevice>> = const { RefCell::new(None) });
+thread_local!(static AUDIO_DEFAULT_ENDPOINT_VOLUME: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) });
 
 // Icons for active and muted states
-thread_local!(static ICON_ACTIVE: RefCell<Option<HICON>> = RefCell::new(None));
-thread_local!(static ICON_ACTIVE_INVERTED: RefCell<Option<HICON>> = RefCell::new(None));
-thread_local!(static ICON_MUTED: RefCell<Option<HICON>> = RefCell::new(None));
-thread_local!(static ICON_MUTED_INVERTED: RefCell<Option<HICON>> = RefCell::new(None));
+thread_local!(static ICON_ACTIVE: RefCell<Option<HICON>> = const { RefCell::new(None) });
+thread_local!(static ICON_ACTIVE_INVERTED: RefCell<Option<HICON>> = const { RefCell::new(None) });
+thread_local!(static ICON_MUTED: RefCell<Option<HICON>> = const { RefCell::new(None) });
+thread_local!(static ICON_MUTED_INVERTED: RefCell<Option<HICON>> = const { RefCell::new(None) });
 
 // Notify icon data registered to show in the notification tray
 thread_local!(static NOTIFY_ICON_DATA: RefCell<NOTIFYICONDATAW> = RefCell::new(Default::default()));
 
 // Context menu shown when right-clicking the notify icon
-thread_local!(static MENU: RefCell<Option<HMENU>> = RefCell::new(None));
-thread_local!(static MENU_AUDIO_ENDPOINTS: RefCell<Vec<PWSTR>> = RefCell::new(Vec::new()));
+thread_local!(static MENU: RefCell<Option<HMENU>> = const { RefCell::new(None) });
+thread_local!(static MENU_AUDIO_ENDPOINTS: RefCell<Vec<PWSTR>> = const { RefCell::new(Vec::new()) });
 
 // Callbacks for receiving notifications about changes
-thread_local!(static AUDIO_ENDPOINT_CALLBACK: RefCell<Option<IMMNotificationClient>> = RefCell::new(None));
-thread_local!(static AUDIO_ENDPOINT_VOLUME_CALLBACK: RefCell<Option<IAudioEndpointVolumeCallback>> = RefCell::new(None));
+thread_local!(static AUDIO_ENDPOINT_CALLBACK: RefCell<Option<IMMNotificationClient>> = const { RefCell::new(None) });
+thread_local!(static AUDIO_ENDPOINT_VOLUME_CALLBACK: RefCell<Option<IAudioEndpointVolumeCallback>> = const { RefCell::new(None) });
 
-#[windows::core::implement(IMMNotificationClient)]
+#[implement(IMMNotificationClient)]
 struct AudioEndpointCallback {
     window: HWND,
 }
 
 #[allow(non_snake_case)]
 impl IMMNotificationClient_Impl for AudioEndpointCallback {
-    fn OnDeviceStateChanged(&self, _pwstrdeviceid: &PCWSTR, _dwnewstate: u32) -> Result<()> {
-        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)).ok() }
+    fn OnDeviceStateChanged(
+        &self,
+        _pwstrdeviceid: &PCWSTR,
+        _dwnewstate: DEVICE_STATE,
+    ) -> Result<()> {
+        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)) }
     }
     fn OnDeviceAdded(&self, _pwstrdeviceid: &PCWSTR) -> Result<()> {
-        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)).ok() }
+        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)) }
     }
     fn OnDeviceRemoved(&self, _pwstrdeviceid: &PCWSTR) -> Result<()> {
-        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)).ok() }
+        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)) }
     }
     fn OnDefaultDeviceChanged(
         &self,
@@ -100,14 +86,14 @@ impl IMMNotificationClient_Impl for AudioEndpointCallback {
         _role: ERole,
         _pwstrdefaultdeviceid: &PCWSTR,
     ) -> Result<()> {
-        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)).ok() }
+        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)) }
     }
     fn OnPropertyValueChanged(&self, _pwstrdeviceid: &PCWSTR, _key: &PROPERTYKEY) -> Result<()> {
-        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)).ok() }
+        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_ENDPOINT, WPARAM(0), LPARAM(0)) }
     }
 }
 
-#[windows::core::implement(IAudioEndpointVolumeCallback)]
+#[implement(IAudioEndpointVolumeCallback)]
 struct AudioEndpointVolumeCallback {
     window: HWND,
 }
@@ -115,7 +101,7 @@ struct AudioEndpointVolumeCallback {
 #[allow(non_snake_case)]
 impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback {
     fn OnNotify(&self, _pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
-        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_VOLUME, WPARAM(0), LPARAM(0)).ok() }
+        unsafe { PostMessageW(self.window, WM_APP_CALLBACK_VOLUME, WPARAM(0), LPARAM(0)) }
     }
 }
 
@@ -123,122 +109,90 @@ impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback {
 #[allow(non_upper_case_globals)]
 pub const PolicyConfig: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 
-#[repr(transparent)]
-pub struct IPolicyConfig(pub IUnknown);
+define_interface!(
+    IPolicyConfig,
+    IPolicyConfig_Vtbl,
+    0xf8679f50_850a_41cf_9c72_430f290290c8
+);
+impl std::ops::Deref for IPolicyConfig {
+    type Target = IUnknown;
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::mem::transmute(self) }
+    }
+}
+interface_hierarchy!(IPolicyConfig, IUnknown);
 impl IPolicyConfig {
     #[allow(non_snake_case, clippy::missing_safety_doc)]
-    pub unsafe fn SetDefaultEndpoint<'a, Param0: IntoParam<'a, PWSTR>>(
-        &self,
-        wszDeviceId: Param0,
-        role: ERole,
-    ) -> Result<()> {
+    pub unsafe fn SetDefaultEndpoint<P0>(&self, wszDeviceId: P0, role: ERole) -> Result<()>
+    where
+        P0: Param<PWSTR>,
+    {
         (Interface::vtable(self).SetDefaultEndpoint)(
             Interface::as_raw(self),
-            wszDeviceId.into_param().abi(),
-            mem::transmute(role),
+            wszDeviceId.param().abi(),
+            role,
         )
         .ok()
     }
 }
-impl From<IPolicyConfig> for IUnknown {
-    fn from(value: IPolicyConfig) -> Self {
-        unsafe { mem::transmute(value) }
-    }
-}
-impl From<&IPolicyConfig> for IUnknown {
-    fn from(value: &IPolicyConfig) -> Self {
-        From::from(Clone::clone(value))
-    }
-}
-impl<'a> IntoParam<'a, IUnknown> for IPolicyConfig {
-    fn into_param(self) -> Param<'a, IUnknown> {
-        Param::Owned(unsafe { mem::transmute(self) })
-    }
-}
-impl<'a> IntoParam<'a, IUnknown> for &'a IPolicyConfig {
-    fn into_param(self) -> Param<'a, IUnknown> {
-        Param::Borrowed(unsafe { mem::transmute(self) })
-    }
-}
-impl Clone for IPolicyConfig {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-impl PartialEq for IPolicyConfig {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl Eq for IPolicyConfig {}
-impl fmt::Debug for IPolicyConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("IPolicyConfig").field(&self.0).finish()
-    }
-}
-unsafe impl Interface for IPolicyConfig {
-    type Vtable = IPolicyConfig_Vtbl;
-    const IID: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
-}
 
 #[allow(non_snake_case)]
 #[repr(C)]
-#[doc(hidden)]
 pub struct IPolicyConfig_Vtbl {
-    pub base__: IUnknownVtbl,
+    pub base__: IUnknown_Vtbl,
     pub GetMixFormat: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
-        waveformatex: *mut RawPtr,
+        waveformatex: *mut c_void,
     ) -> HRESULT,
     pub GetDeviceFormat: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
         param0: i32,
-        waveformatex: *mut RawPtr,
+        waveformatex: *mut c_void,
     ) -> HRESULT,
-    pub ResetDeviceFormat: unsafe extern "system" fn(this: RawPtr, pwstrid: PWSTR) -> HRESULT,
+    pub ResetDeviceFormat: unsafe extern "system" fn(this: c_void, pwstrid: PWSTR) -> HRESULT,
     pub SetDeviceFormat: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
-        waveformatex0: RawPtr,
-        waveformatex1: *mut RawPtr,
+        waveformatex0: c_void,
+        waveformatex1: *mut c_void,
     ) -> HRESULT,
     pub GetProcessingPeriod: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
         param0: i32,
-        param1: RawPtr,
-        param1: *mut RawPtr,
+        param1: c_void,
+        param1: *mut c_void,
     ) -> HRESULT,
     pub SetProcessingPeriod:
-        unsafe extern "system" fn(this: RawPtr, pwstrid: PWSTR, param0: RawPtr) -> HRESULT,
+        unsafe extern "system" fn(this: c_void, pwstrid: PWSTR, param0: c_void) -> HRESULT,
     pub GetShareMode: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
-        devicesharemode: *mut RawPtr,
+        devicesharemode: *mut c_void,
     ) -> HRESULT,
     pub SetShareMode: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
-        devicesharemode: *mut RawPtr,
+        devicesharemode: *mut c_void,
     ) -> HRESULT,
     pub GetPropertyValue: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
-        key: RawPtr,
-        propvariant: *mut RawPtr,
+        key: c_void,
+        propvariant: *mut c_void,
     ) -> HRESULT,
     pub SetPropertyValue: unsafe extern "system" fn(
-        this: RawPtr,
+        this: *mut c_void,
         pwstrid: PWSTR,
-        key: RawPtr,
-        propvariant: *mut RawPtr,
+        key: c_void,
+        propvariant: *mut c_void,
     ) -> HRESULT,
     pub SetDefaultEndpoint:
-        unsafe extern "system" fn(this: RawPtr, pwstrid: PWSTR, role: ERole) -> HRESULT,
+        unsafe extern "system" fn(this: *mut c_void, pwstrid: PWSTR, role: ERole) -> HRESULT,
     pub SetEndpointVisibility:
-        unsafe extern "system" fn(this: RawPtr, pwstrid: PWSTR, param0: i32) -> HRESULT,
+        unsafe extern "system" fn(this: *mut c_void, pwstrid: PWSTR, param0: i32) -> HRESULT,
 }
 
 // Audio initialization functions
@@ -253,7 +207,7 @@ fn init_audio_endpoint() -> Result<()> {
                     }
                     .map_or_else(
                         |error| {
-                            if error.win32_error() == Some(ERROR_NOT_FOUND) {
+                            if error.code() == ERROR_NOT_FOUND.to_hresult() {
                                 Ok(None)
                             } else {
                                 Err(error)
@@ -273,38 +227,31 @@ fn init_audio_endpoint_volume() -> Result<()> {
     deinit_audio_endpoint_volume();
     AUDIO_DEFAULT_ENDPOINT_VOLUME.with(|global_audio_endpoint_volume| {
         global_audio_endpoint_volume.replace(AUDIO_DEFAULT_ENDPOINT.with(
-            |global_audio_endpoint| match &*global_audio_endpoint.borrow() {
-                Some(audio_endpoint) => {
-                    let mut audio_endpoint_volume_pointer: Option<IAudioEndpointVolume> = None;
-                    unsafe {
-                        audio_endpoint.Activate(
-                            &IAudioEndpointVolume::IID,
-                            CLSCTX_ALL,
-                            std::ptr::null(),
-                            &mut audio_endpoint_volume_pointer as *mut _ as *mut _,
-                        )
+            |global_audio_endpoint| {
+                match &*global_audio_endpoint.borrow() {
+                    Some(audio_endpoint) => {
+                        unsafe { audio_endpoint.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }
+                            .map_or_else(
+                                |error| {
+                                    if error.code() == E_NOINTERFACE {
+                                        Ok(None)
+                                    } else {
+                                        Err(error)
+                                    }
+                                },
+                                |audio_endpoint_volume| {
+                                    AUDIO_ENDPOINT_VOLUME_CALLBACK
+                                        .with(|audio_endpoint_volume_callback| unsafe {
+                                            audio_endpoint_volume.RegisterControlChangeNotify(
+                                                (*audio_endpoint_volume_callback.borrow()).as_ref(),
+                                            )
+                                        })
+                                        .map(|_| Some(audio_endpoint_volume))
+                                },
+                            )
                     }
-                    .map_or_else(
-                        |error| {
-                            if error.code() == E_NOINTERFACE {
-                                Ok(None)
-                            } else {
-                                Err(error)
-                            }
-                        },
-                        |_| match audio_endpoint_volume_pointer {
-                            Some(audio_endpoint_volume) => AUDIO_ENDPOINT_VOLUME_CALLBACK
-                                .with(|audio_endpoint_volume_callback| unsafe {
-                                    audio_endpoint_volume.RegisterControlChangeNotify(
-                                        &*audio_endpoint_volume_callback.borrow(),
-                                    )
-                                })
-                                .map(|_| Some(audio_endpoint_volume)),
-                            _ => Ok(None),
-                        },
-                    )
+                    _ => Ok(None),
                 }
-                _ => Ok(None),
             },
         )?);
         Ok(())
@@ -317,8 +264,9 @@ fn deinit_audio_endpoint_volume() {
         if let Some(audio_endpoint_volume) = global.replace(None) {
             AUDIO_ENDPOINT_VOLUME_CALLBACK
                 .with(|audio_endpoint_volume_callback| unsafe {
-                    audio_endpoint_volume
-                        .UnregisterControlChangeNotify(&*audio_endpoint_volume_callback.borrow())
+                    audio_endpoint_volume.UnregisterControlChangeNotify(
+                        (*audio_endpoint_volume_callback.borrow()).as_ref(),
+                    )
                 })
                 .ok();
         }
@@ -351,9 +299,7 @@ fn set_default_audio_capture_device(device_id: PWSTR) -> Result<()> {
         match &*global_audio_policy_config.borrow() {
             Some(audio_policy_config) => {
                 for role in [eConsole, eMultimedia, eCommunications] {
-                    unsafe {
-                        audio_policy_config.SetDefaultEndpoint(device_id, role)?;
-                    }
+                    unsafe { audio_policy_config.SetDefaultEndpoint(device_id, role) }?;
                 }
                 Ok(())
             }
@@ -377,11 +323,11 @@ fn invert_icon(icon: HICON) -> Result<HICON> {
     unsafe {
         // Get info about the icon
         let mut icon_info: ICONINFO = Default::default();
-        GetIconInfo(icon, &mut icon_info).ok()?;
+        GetIconInfo(icon, &mut icon_info)?;
 
         // Check we have a color icon we can invert
         if icon_info.hbmColor.is_invalid() {
-            return Ok(icon)
+            return Ok(icon);
         }
 
         // Retrieve the icon bitmap from the handle
@@ -390,52 +336,58 @@ fn invert_icon(icon: HICON) -> Result<HICON> {
             Gdi::GetObjectW(
                 icon_info.hbmColor,
                 std::mem::size_of::<BITMAP>() as i32,
-                &mut icon_bitmap as *mut _ as *mut _
-            ) as usize == std::mem::size_of::<BITMAP>(),
+                Some(&mut icon_bitmap as *mut _ as *mut _)
+            ) as usize
+                == std::mem::size_of::<BITMAP>(),
             "Failed to read icon bitmap"
         );
 
         // Create device context for accessing the icon
-        let icon_dc: CreatedHDC = CreateCompatibleDC(None);
+        let icon_dc: HDC = CreateCompatibleDC(None);
         let icon_dc_prevobj = Gdi::SelectObject(icon_dc, icon_info.hbmColor);
 
         // Create new 32-bit RGBA bitmap to contain inverted icon
-        let mut inverted_info: BITMAPV5HEADER = Default::default();
-        inverted_info.bV5Size = std::mem::size_of::<BITMAPV5HEADER>() as u32;
-        inverted_info.bV5Width = icon_bitmap.bmWidth;
-        inverted_info.bV5Height = icon_bitmap.bmHeight;
-        inverted_info.bV5Planes = 1;
-        inverted_info.bV5BitCount = 32;
-        inverted_info.bV5Compression = BI_BITFIELDS as u32;
-        inverted_info.bV5RedMask = 0x00ff0000;
-        inverted_info.bV5GreenMask = 0x0000ff00;
-        inverted_info.bV5BlueMask  = 0x000000ff;
-        inverted_info.bV5AlphaMask = 0xff000000;
+        let mut inverted_info = BITMAPV5HEADER {
+            bV5Size: std::mem::size_of::<BITMAPV5HEADER>() as u32,
+            bV5Width: icon_bitmap.bmWidth,
+            bV5Height: icon_bitmap.bmHeight,
+            bV5Planes: 1,
+            bV5BitCount: 32,
+            bV5Compression: BI_BITFIELDS,
+            bV5RedMask: 0x00ff0000,
+            bV5GreenMask: 0x0000ff00,
+            bV5BlueMask: 0x000000ff,
+            bV5AlphaMask: 0xff000000,
+            ..Default::default()
+        };
 
         // Pointer to the RGBA pixels of the inverted bitmap
         let mut inverted_pixels: *mut u32 = std::ptr::null_mut();
 
         // Create inverted bitmap using a new device context
-        let inverted_dc: CreatedHDC = CreateCompatibleDC(None);
+        let inverted_dc: HDC = CreateCompatibleDC(None);
         let inverted_bitmap = CreateDIBSection(
             inverted_dc,
             &mut inverted_info as *mut _ as *const BITMAPINFO,
             DIB_RGB_COLORS,
             &mut inverted_pixels as *mut _ as *mut *mut c_void,
             None,
-            0
+            0,
         )?;
         let inverted_dc_prevobj = Gdi::SelectObject(inverted_dc, inverted_bitmap);
 
         // Create a copy of the icon by blitting from the DC with the original to the new one
         BitBlt(
             inverted_dc,
-            0, 0,
-            icon_bitmap.bmWidth, icon_bitmap.bmHeight,
+            0,
+            0,
+            icon_bitmap.bmWidth,
+            icon_bitmap.bmHeight,
             icon_dc,
-            0, 0,
-            SRCCOPY
-        ).ok()?;
+            0,
+            0,
+            SRCCOPY,
+        )?;
 
         // Remove DC for original icon since we don't need it after blitting is done
         Gdi::SelectObject(icon_dc, icon_dc_prevobj);
@@ -464,7 +416,7 @@ fn load_icons(instance: HINSTANCE) -> Result<()> {
     let icon_active = unsafe {
         ExtractIconW(
             instance,
-            "%SystemRoot%\\System32\\SndVolSSO.dll",
+            w!("%SystemRoot%\\System32\\SndVolSSO.dll"),
             141u32.wrapping_neg(),
         )
     };
@@ -472,32 +424,38 @@ fn load_icons(instance: HINSTANCE) -> Result<()> {
     let icon_muted = unsafe {
         ExtractIconW(
             instance,
-            "%SystemRoot%\\System32\\SndVolSSO.dll",
+            w!("%SystemRoot%\\System32\\SndVolSSO.dll"),
             140u32.wrapping_neg(),
         )
     };
     let icon_muted_inverted = invert_icon(icon_muted)?;
 
     assert!(!icon_active.is_invalid(), "Active icon is not valid.");
-    assert!(!icon_active_inverted.is_invalid(), "Active inverted icon is not valid.");
+    assert!(
+        !icon_active_inverted.is_invalid(),
+        "Active inverted icon is not valid."
+    );
     assert!(!icon_muted.is_invalid(), "Muted icon is not valid.");
-    assert!(!icon_muted_inverted.is_invalid(), "Muted inverted icon is not valid.");
+    assert!(
+        !icon_muted_inverted.is_invalid(),
+        "Muted inverted icon is not valid."
+    );
 
     // Replace currently loaded icons
     ICON_ACTIVE.with(|global| match global.replace(Some(icon_active)) {
-        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        Some(old_icon) => unsafe { DestroyIcon(old_icon) },
         _ => Ok(()),
     })?;
     ICON_ACTIVE_INVERTED.with(|global| match global.replace(Some(icon_active_inverted)) {
-        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        Some(old_icon) => unsafe { DestroyIcon(old_icon) },
         _ => Ok(()),
     })?;
     ICON_MUTED.with(|global| match global.replace(Some(icon_muted)) {
-        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        Some(old_icon) => unsafe { DestroyIcon(old_icon) },
         _ => Ok(()),
     })?;
     ICON_MUTED_INVERTED.with(|global| match global.replace(Some(icon_muted_inverted)) {
-        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        Some(old_icon) => unsafe { DestroyIcon(old_icon) },
         _ => Ok(()),
     })?;
 
@@ -511,18 +469,20 @@ fn should_use_inverted_icon() -> bool {
     if unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-            "AppsUseLightTheme",
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
             RRF_RT_REG_DWORD,
-            std::ptr::null_mut(),
-            buffer.as_mut_ptr() as *mut c_void,
-            &mut size as *mut u32,
-        ).ok()
-    }.is_err() {
+            None,
+            Some(buffer.as_mut_ptr() as *mut c_void),
+            Some(&mut size as *mut u32),
+        )
+        .ok()
+        .is_err()
+    } {
         return false;
     }
     assert!(size == 4, "Invalid size for DWORD.");
-    return i32::from_le_bytes(buffer) != 0;
+    i32::from_le_bytes(buffer) != 0
 }
 
 // Retrieves the microphone status and updates the icon and tooltip
@@ -562,29 +522,13 @@ fn update_icon_data() -> Result<()> {
         AUDIO_DEFAULT_ENDPOINT.with(|global_audio_endpoint| {
             match &*global_audio_endpoint.borrow() {
                 Some(audio_endpoint) => {
-                    let mut device_name_buffer = unsafe {
+                    let device_name = unsafe {
                         audio_endpoint
                             .OpenPropertyStore(STGM_READ)?
                             .GetValue(&PKEY_Device_FriendlyName)?
-                            .Anonymous
-                            .Anonymous
-                            .Anonymous
-                            .pwszVal
-                            .0
+                            .to_string()
                     };
-                    let device_name_prefix = std::iter::from_fn(move || {
-                        let chr;
-                        unsafe {
-                            chr = if *device_name_buffer != 0 {
-                                Some(*device_name_buffer)
-                            } else {
-                                None
-                            };
-                            device_name_buffer = device_name_buffer.add(1);
-                        }
-                        chr
-                    })
-                    .chain(": ".encode_utf16());
+                    let device_name_prefix = device_name.encode_utf16().chain(": ".encode_utf16());
                     AUDIO_DEFAULT_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
                         Some(audio_endpoint_volume) => {
                             let volume = if unsafe { audio_endpoint_volume.GetMute() }?.into() {
@@ -691,32 +635,26 @@ fn update_menu() -> Result<()> {
                                     MF_DISABLED | MF_GRAYED,
                                     IDM_NO_ENDPOINTS as usize,
                                     LABEL_NO_CAPTURE_DEVICES,
-                                )
-                                .ok()?;
-                            }
-                            unsafe {
+                                )?;
                                 AppendMenuW(
                                     menu,
                                     MF_SEPARATOR,
                                     IDM_SEPARATOR as usize,
-                                    PCWSTR::default(),
-                                )
-                                .ok()?;
-                            }
-                            unsafe {
+                                    PCWSTR::null(),
+                                )?;
                                 AppendMenuW(
                                     menu,
                                     MF_ENABLED | MF_STRING,
                                     IDM_EXIT as usize,
                                     LABEL_EXIT,
-                                )
-                                .ok()?;
+                                )?;
                             }
                             menu
                         }));
                     }
 
-                    let menu = &*global_menu.borrow();
+                    let menuref = &*global_menu.borrow();
+                    let menu = menuref.as_ref();
                     let default_endpoint_id =
                         AUDIO_DEFAULT_ENDPOINT.with(|global_audio_default_endpoint| {
                             global_audio_default_endpoint.borrow().as_ref().and_then(
@@ -728,23 +666,23 @@ fn update_menu() -> Result<()> {
                     MENU_AUDIO_ENDPOINTS.with(|global_menu_audio_endpoints| -> Result<()> {
                         let mut menu_audio_endpoints = global_menu_audio_endpoints.borrow_mut();
                         if menu_audio_endpoints.len() == 0 && devices_count > 0 {
-                            unsafe { RemoveMenu(menu, IDM_NO_ENDPOINTS as u32, MF_BYCOMMAND) }
-                                .ok()?;
+                            unsafe {
+                                RemoveMenu(menu, IDM_NO_ENDPOINTS as u32, MF_BYCOMMAND)?;
+                            }
                         }
                         for i in 0..devices_count {
-                            let device = unsafe { devices.Item(i as u32) }?;
+                            let device = unsafe { devices.Item(i as u32)? };
                             let device_id = unsafe { device.GetId() }?;
-                            let device_name_buffer = unsafe {
+                            let mut device_name_buffer = unsafe {
                                 device
                                     .OpenPropertyStore(STGM_READ)?
                                     .GetValue(&PKEY_Device_FriendlyName)?
-                                    .Anonymous
-                                    .Anonymous
-                                    .Anonymous
-                                    .pwszVal
-                                    .0
-                            };
-                            let device_name = PWSTR(device_name_buffer);
+                            }
+                            .to_string()
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect::<Vec<u16>>();
+                            let device_name = PWSTR(device_name_buffer.as_mut_ptr());
                             let device_is_default = match default_endpoint_id {
                                 Some(id) => pwstr_eq(device_id, id),
                                 _ => false,
@@ -755,10 +693,10 @@ fn update_menu() -> Result<()> {
                                     found = true;
                                     for _ in 0..(j - i) {
                                         unsafe {
-                                            CoTaskMemFree(
+                                            CoTaskMemFree(Some(
                                                 menu_audio_endpoints.remove(i).0 as *const c_void,
-                                            );
-                                            RemoveMenu(menu, i as u32, MF_BYPOSITION).ok()?;
+                                            ));
+                                            RemoveMenu(menu, i as u32, MF_BYPOSITION)?;
                                         }
                                     }
                                     unsafe {
@@ -778,8 +716,7 @@ fn update_menu() -> Result<()> {
                                                 dwTypeData: device_name,
                                                 ..Default::default()
                                             },
-                                        )
-                                        .ok()?;
+                                        )?;
                                     }
                                     break;
                                 }
@@ -805,8 +742,7 @@ fn update_menu() -> Result<()> {
                                             dwTypeData: device_name,
                                             ..Default::default()
                                         },
-                                    )
-                                    .ok()?;
+                                    )?;
                                 }
                             }
                         }
@@ -814,17 +750,13 @@ fn update_menu() -> Result<()> {
                             devices_count == 0 && menu_audio_endpoints.len() > 0;
                         while menu_audio_endpoints.len() > devices_count {
                             unsafe {
-                                CoTaskMemFree(
+                                CoTaskMemFree(Some(
                                     menu_audio_endpoints.pop().unwrap().0 as *const c_void,
-                                );
-                                RemoveMenu(menu, devices_count as u32, MF_BYPOSITION)
-                            }
-                            .ok()?;
+                                ));
+                                RemoveMenu(menu, devices_count as u32, MF_BYPOSITION)?
+                            };
                         }
                         if add_no_devices_label {
-                            let mut no_devices_label_buffer =
-                                LABEL_NO_CAPTURE_DEVICES.encode_utf16().collect::<Vec<_>>();
-                            let no_devices_label = PWSTR(no_devices_label_buffer.as_mut_ptr());
                             unsafe {
                                 InsertMenuItemW(
                                     menu,
@@ -836,18 +768,26 @@ fn update_menu() -> Result<()> {
                                         fType: MFT_STRING,
                                         fState: MFS_DISABLED | MFS_GRAYED,
                                         wID: IDM_NO_ENDPOINTS as u32,
-                                        dwTypeData: no_devices_label,
+                                        dwTypeData: PWSTR(
+                                            LABEL_NO_CAPTURE_DEVICES
+                                                .to_string()?
+                                                .encode_utf16()
+                                                .chain(std::iter::once(0))
+                                                .collect::<Vec<u16>>()
+                                                .as_mut_ptr(),
+                                        ),
                                         ..Default::default()
                                     },
-                                )
-                                .ok()?;
+                                )?;
                             }
                         }
                         Ok(())
                     })?;
 
                     if let Some(id) = default_endpoint_id {
-                        unsafe { CoTaskMemFree(id.0 as *const c_void) }
+                        unsafe {
+                            CoTaskMemFree(Some(id.0 as *const c_void));
+                        }
                     };
                     Ok(())
                 }
@@ -863,9 +803,9 @@ fn show_menu(window: HWND, x: i32, y: i32) -> Result<()> {
     MENU.with(|menu| {
         unsafe {
             // Set our window as foreground so the menu disappears when focus is lost
-            SetForegroundWindow(window);
+            SetForegroundWindow(window).ok().ok();
             TrackPopupMenuEx(
-                *menu.borrow(),
+                (*menu.borrow()).as_ref(),
                 (TPM_RIGHTBUTTON
                     | if GetSystemMetrics(SM_MENUDROPALIGNMENT) != 0 {
                         TPM_RIGHTALIGN
@@ -876,7 +816,7 @@ fn show_menu(window: HWND, x: i32, y: i32) -> Result<()> {
                 x,
                 y,
                 window,
-                std::ptr::null(),
+                None,
             )
             .ok()
         }
@@ -893,7 +833,7 @@ extern "system" fn window_callback(
     match message {
         WM_CREATE => {
             // Listen for taskbar created messages since we should re-add our icon
-            let wm_taskbar_created = unsafe { RegisterWindowMessageW("TaskbarCreated") };
+            let wm_taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
             assert!(wm_taskbar_created != 0);
             WM_TASKBAR_CREATED.with(|global| {
                 global.replace(Some(wm_taskbar_created));
@@ -901,7 +841,7 @@ extern "system" fn window_callback(
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+            let instance: HINSTANCE = unsafe { GetModuleHandleW(None).unwrap().into() };
             assert!(instance.0 != 0);
             load_icons(instance).unwrap();
             update_notify_icon().ok();
@@ -934,7 +874,7 @@ extern "system" fn window_callback(
                 .ok();
             update_notify_icon().ok();
             update_menu()
-                .and_then(|()| unsafe { DrawMenuBar(window).ok() })
+                .and_then(|()| unsafe { DrawMenuBar(window) })
                 .ok();
             LRESULT(0)
         }
@@ -946,7 +886,7 @@ extern "system" fn window_callback(
         WM_COMMAND => {
             match (wparam.0 as u32 & 0xffff) as u16 {
                 IDM_EXIT => unsafe {
-                    DestroyWindow(window);
+                    DestroyWindow(window).ok();
                 },
                 i => {
                     let i = i as usize;
@@ -962,7 +902,7 @@ extern "system" fn window_callback(
         }
         WM_CLOSE => {
             unsafe {
-                DestroyWindow(window);
+                DestroyWindow(window).ok();
             }
             LRESULT(0)
         }
@@ -987,7 +927,7 @@ extern "system" fn window_callback(
 }
 
 fn main() -> Result<()> {
-    let instance = unsafe { GetModuleHandleW(None) }?;
+    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     assert!(instance.0 != 0);
 
     // Main window class definition
@@ -1020,14 +960,14 @@ fn main() -> Result<()> {
             None,
             None,
             instance,
-            std::ptr::null(),
+            None,
         )
     };
     assert!(window.0 != 0);
 
     // Initialize COM runtime
     unsafe {
-        CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED)?;
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
     }
 
     // Initiate callbacks
@@ -1048,7 +988,7 @@ fn main() -> Result<()> {
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
     AUDIO_ENDPOINT_CALLBACK.with(|audio_endpoint_callback| unsafe {
         audio_endpoint_enumerator
-            .RegisterEndpointNotificationCallback(&*audio_endpoint_callback.borrow())
+            .RegisterEndpointNotificationCallback((*audio_endpoint_callback.borrow()).as_ref())
     })?;
     AUDIO_ENDPOINT_ENUMERATOR.with(|global| {
         global.replace(Some(audio_endpoint_enumerator));
@@ -1099,7 +1039,9 @@ fn main() -> Result<()> {
         if let Some(audio_endpoint_enumerator) = global.replace(None) {
             AUDIO_ENDPOINT_CALLBACK.with(|audio_endpoint_callback| unsafe {
                 audio_endpoint_enumerator
-                    .UnregisterEndpointNotificationCallback(&*audio_endpoint_callback.borrow())
+                    .UnregisterEndpointNotificationCallback(
+                        (*audio_endpoint_callback.borrow()).as_ref(),
+                    )
                     .unwrap()
             });
         }
@@ -1112,11 +1054,11 @@ fn main() -> Result<()> {
 
     // Deallocate icons
     ICON_ACTIVE.with(|global| match global.replace(None) {
-        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        Some(old_icon) => unsafe { DestroyIcon(old_icon) },
         _ => Ok(()),
     })?;
     ICON_MUTED.with(|global| match global.replace(None) {
-        Some(old_icon) => unsafe { DestroyIcon(old_icon).ok() },
+        Some(old_icon) => unsafe { DestroyIcon(old_icon) },
         _ => Ok(()),
     })?;
 
@@ -1131,7 +1073,7 @@ fn main() -> Result<()> {
 
     // Unregister the window class
     unsafe {
-        UnregisterClassW(window_class_name, instance).ok()?;
+        UnregisterClassW(window_class_name, instance)?;
     }
 
     if message.wParam.0 == 0 {

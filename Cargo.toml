@@ -4,10 +4,12 @@ version = "0.2.2"
 edition = "2021"
 build = "build.rs"
 
+[dependencies]
+windows-core = { version = "0.56.0" }
+
 [dependencies.windows]
-version = "0.37.0"
+version = "0.56.0"
 features = [
-    "alloc",
     "implement",
     "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",

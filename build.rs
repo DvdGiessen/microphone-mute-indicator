@@ -1,5 +1,9 @@
 fn main() -> std::io::Result<()> {
-    winres::WindowsResource::new()
-        .set_manifest_file("manifest.xml")
-        .compile()
+    if cfg!(windows) {
+        winres::WindowsResource::new()
+            .set_manifest_file("manifest.xml")
+            .compile()
+    } else {
+        Ok(())
+    }
 }
