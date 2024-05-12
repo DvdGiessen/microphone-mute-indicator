@@ -12,7 +12,10 @@ use windows::{
         Foundation::*,
         Graphics::{Gdi, Gdi::*},
         Media::Audio::{Endpoints::*, *},
-        System::{Com::*, LibraryLoader::GetModuleHandleW, Registry::*},
+        System::{
+            Com::*, LibraryLoader::GetModuleHandleW, Registry::*,
+            SystemInformation::GetSystemDirectoryW, Threading::*,
+        },
         UI::{
             Shell::{PropertiesSystem::PROPERTYKEY, *},
             WindowsAndMessaging::*,
@@ -25,10 +28,12 @@ const WM_APP_CALLBACK_ENDPOINT: u32 = WM_APP + 2;
 const WM_APP_CALLBACK_VOLUME: u32 = WM_APP + 3;
 
 const IDM_EXIT: u16 = 0u16.wrapping_sub(1);
-const IDM_SEPARATOR: u16 = 0u16.wrapping_sub(2);
-const IDM_NO_ENDPOINTS: u16 = 0u16.wrapping_sub(3);
+const IDM_OPEN_SOUNDCONTROLPANEL: u16 = 0u16.wrapping_sub(2);
+const IDM_SEPARATOR: u16 = 0u16.wrapping_sub(3);
+const IDM_NO_ENDPOINTS: u16 = 0u16.wrapping_sub(4);
 
 const LABEL_EXIT: PCWSTR = w!("E&xit\0");
+const LABEL_OPEN_SOUNDCONTROLPANEL: PCWSTR = w!("Open Sound Control Panel\0");
 const LABEL_NO_CAPTURE_DEVICES: PCWSTR = w!("No audio capture devices found\0");
 const LABEL_NO_DEFAULT_DEVICE: &str = "No default communications audio capture device found!";
 const LABEL_MUTED: &str = "muted";
@@ -291,6 +296,55 @@ fn toggle_mute() -> Result<()> {
         },
         _ => Ok(()),
     })
+}
+
+// Function for opening the Sound Control Panel
+fn open_sound_control_panel_recording_tab() -> Result<()> {
+    let system_directory = {
+        let mut buffer = [0u16; MAX_PATH as usize];
+        let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) };
+        if length == 0 || length > buffer.len() as u32 {
+            Err(Error::from_win32())
+        } else {
+            Ok(buffer
+                .into_iter()
+                .take(length as usize)
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>())
+        }
+    }?;
+    let command = system_directory
+        .clone()
+        .into_iter()
+        .take_while(|c| *c != 0)
+        .chain("\\control.exe".encode_utf16())
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let mut arguments = command
+        .clone()
+        .into_iter()
+        .take_while(|c| *c != 0)
+        .chain(" mmsys.cpl,,1".to_string().encode_utf16())
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    unsafe {
+        CreateProcessW(
+            PCWSTR(command.as_ptr()),
+            PWSTR(arguments.as_mut_ptr()),
+            None,
+            None,
+            FALSE,
+            DETACHED_PROCESS,
+            None,
+            PCWSTR(system_directory.as_ptr()),
+            &STARTUPINFOW {
+                ..Default::default()
+            },
+            &mut PROCESS_INFORMATION {
+                ..Default::default()
+            },
+        )
+    }
 }
 
 // Function for setting the default audio device
@@ -645,6 +699,12 @@ fn update_menu() -> Result<()> {
                                 AppendMenuW(
                                     menu,
                                     MF_ENABLED | MF_STRING,
+                                    IDM_OPEN_SOUNDCONTROLPANEL as usize,
+                                    LABEL_OPEN_SOUNDCONTROLPANEL,
+                                )?;
+                                AppendMenuW(
+                                    menu,
+                                    MF_ENABLED | MF_STRING,
                                     IDM_EXIT as usize,
                                     LABEL_EXIT,
                                 )?;
@@ -888,6 +948,9 @@ extern "system" fn window_callback(
                 IDM_EXIT => unsafe {
                     DestroyWindow(window).ok();
                 },
+                IDM_OPEN_SOUNDCONTROLPANEL => {
+                    open_sound_control_panel_recording_tab().ok();
+                }
                 i => {
                     let i = i as usize;
                     MENU_AUDIO_ENDPOINTS.with(|global_menu_audio_endpoints| {
