@@ -3,8 +3,8 @@
 
 #![windows_subsystem = "windows"]
 
-use std::{cell::RefCell, ffi::c_void, thread::LocalKey};
-
+use argh::FromArgs;
+use std::{cell::RefCell, ffi::c_void};
 use windows::{
     core::*,
     Win32::{
@@ -13,7 +13,7 @@ use windows::{
         Graphics::{Gdi, Gdi::*},
         Media::Audio::{Endpoints::*, *},
         System::{
-            Com::*, LibraryLoader::GetModuleHandleW, Registry::*,
+            Com::*, Console::*, LibraryLoader::GetModuleHandleW, Registry::*,
             SystemInformation::GetSystemDirectoryW, Threading::*,
         },
         UI::{
@@ -55,7 +55,7 @@ thread_local!(static ICON_MUTED: RefCell<Option<HICON>> = const { RefCell::new(N
 thread_local!(static ICON_MUTED_INVERTED: RefCell<Option<HICON>> = const { RefCell::new(None) });
 
 // Notify icon data registered to show in the notification tray
-thread_local!(static NOTIFY_ICON_DATA: RefCell<NOTIFYICONDATAW> = RefCell::new(Default::default()));
+thread_local!(static NOTIFY_ICON_DATA: RefCell<Option<NOTIFYICONDATAW>> = const { RefCell::new(None) });
 
 // Context menu shown when right-clicking the notify icon
 thread_local!(static MENU: RefCell<Option<HMENU>> = const { RefCell::new(None) });
@@ -298,6 +298,16 @@ fn toggle_mute() -> Result<()> {
     })
 }
 
+// Functions for setting the muted state
+fn set_muted(muted: bool) -> Result<()> {
+    AUDIO_DEFAULT_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
+        Some(audio_endpoint_volume) => unsafe {
+            audio_endpoint_volume.SetMute(muted, std::ptr::null())
+        },
+        _ => Ok(()),
+    })
+}
+
 // Function for opening the Sound Control Panel
 fn open_sound_control_panel_recording_tab() -> Result<()> {
     let system_directory = {
@@ -345,6 +355,23 @@ fn open_sound_control_panel_recording_tab() -> Result<()> {
             },
         )
     }
+}
+
+// Function for setting the volume to the maximum value
+fn set_volume_to_max() -> Result<()> {
+    AUDIO_DEFAULT_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
+        Some(audio_endpoint_volume) => unsafe {
+            if audio_endpoint_volume
+                .GetMasterVolumeLevelScalar()
+                .is_ok_and(|v| v < 1.0)
+            {
+                audio_endpoint_volume.SetMasterVolumeLevelScalar(1.0, std::ptr::null())
+            } else {
+                Ok(())
+            }
+        },
+        _ => Ok(()),
+    })
 }
 
 // Function for setting the default audio device
@@ -546,101 +573,107 @@ fn update_icon_data() -> Result<()> {
     } else {
         (&ICON_ACTIVE, &ICON_MUTED)
     };
-    NOTIFY_ICON_DATA.with(|global_notify_icon_data| {
-        let notify_icon_data = &mut *global_notify_icon_data.borrow_mut();
-        let max_text_len = notify_icon_data.szTip.len() - 1;
-        let mut set_icon_data =
-            |icon: &'static LocalKey<RefCell<Option<HICON>>>,
-             text: &mut dyn Iterator<Item = u16>| {
-                icon.with(|icon_ref| match *icon_ref.borrow() {
-                    Some(icon_id) if !icon_id.is_invalid() => {
-                        notify_icon_data.hIcon = icon_id;
-                        notify_icon_data.uFlags |= NIF_ICON;
-                    }
-                    _ => {
-                        notify_icon_data.hIcon = Default::default();
-                        notify_icon_data.uFlags &= !NIF_ICON;
-                    }
-                });
-                notify_icon_data
-                    .szTip
-                    .iter_mut()
-                    .zip(text.take(max_text_len).chain(std::iter::repeat(0)))
-                    .for_each(|(ptr, chr)| *ptr = chr);
-                if notify_icon_data.szTip[0] == 0 {
-                    notify_icon_data.uFlags &= !(NIF_TIP | NIF_SHOWTIP);
-                } else {
-                    notify_icon_data.uFlags |= NIF_TIP | NIF_SHOWTIP;
-                }
-            };
-        AUDIO_DEFAULT_ENDPOINT.with(|global_audio_endpoint| {
-            match &*global_audio_endpoint.borrow() {
-                Some(audio_endpoint) => {
-                    let device_name = unsafe {
-                        audio_endpoint
-                            .OpenPropertyStore(STGM_READ)?
-                            .GetValue(&PKEY_Device_FriendlyName)?
-                            .to_string()
-                    };
-                    let device_name_prefix = device_name.encode_utf16().chain(": ".encode_utf16());
-                    AUDIO_DEFAULT_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
-                        Some(audio_endpoint_volume) => {
-                            let volume = if unsafe { audio_endpoint_volume.GetMute() }?.into() {
-                                None
-                            } else {
-                                Some(format!(
-                                    "{:.0}%",
-                                    100f32
-                                        * unsafe {
-                                            audio_endpoint_volume.GetMasterVolumeLevelScalar()
-                                        }?
-                                ))
-                            };
+    let (icon, text) = AUDIO_DEFAULT_ENDPOINT.with(|global_audio_endpoint| {
+        match &*global_audio_endpoint.borrow() {
+            Some(audio_endpoint) => {
+                let device_name = unsafe {
+                    audio_endpoint
+                        .OpenPropertyStore(STGM_READ)?
+                        .GetValue(&PKEY_Device_FriendlyName)?
+                        .to_string()
+                };
+                let device_name_prefix = device_name.encode_utf16().chain(": ".encode_utf16());
+                AUDIO_DEFAULT_ENDPOINT_VOLUME.with(|global| match &*global.borrow() {
+                    Some(audio_endpoint_volume) => {
+                        let volume = if unsafe { audio_endpoint_volume.GetMute() }?.into() {
+                            None
+                        } else {
+                            Some(format!(
+                                "{:.0}%",
+                                100f32
+                                    * unsafe {
+                                        audio_endpoint_volume.GetMasterVolumeLevelScalar()
+                                    }?
+                            ))
+                        };
 
-                            set_icon_data(
-                                if volume.is_some() {
-                                    icon_active
-                                } else {
-                                    icon_muted
-                                },
-                                &mut device_name_prefix.chain(
+                        Ok::<_, HRESULT>((
+                            if volume.is_some() {
+                                icon_active
+                            } else {
+                                icon_muted
+                            },
+                            device_name_prefix
+                                .chain(
                                     match volume {
                                         Some(volume_text) => volume_text,
                                         _ => LABEL_MUTED.to_owned(),
                                     }
                                     .encode_utf16(),
-                                ),
-                            );
-                            Ok(())
-                        }
-                        _ => {
-                            set_icon_data(
-                                icon_muted,
-                                &mut device_name_prefix.chain(LABEL_VOLUME_UNKNOWN.encode_utf16()),
-                            );
-                            Ok(())
-                        }
-                    })
+                                )
+                                .collect::<Vec<_>>(),
+                        ))
+                    }
+                    _ => Ok((
+                        icon_muted,
+                        device_name_prefix
+                            .chain(LABEL_VOLUME_UNKNOWN.encode_utf16())
+                            .collect(),
+                    )),
+                })
+            }
+            _ => Ok((icon_muted, LABEL_NO_DEFAULT_DEVICE.encode_utf16().collect())),
+        }
+    })?;
+    NOTIFY_ICON_DATA.with(|global_notify_icon_data| {
+        global_notify_icon_data.replace_with(|previous_notify_icon_data| {
+            let mut notify_icon_data = previous_notify_icon_data.unwrap_or_default();
+            let max_text_len = notify_icon_data.szTip.len() - 1;
+            icon.with(|icon_ref| match *icon_ref.borrow() {
+                Some(icon_id) if !icon_id.is_invalid() => {
+                    notify_icon_data.hIcon = icon_id;
+                    notify_icon_data.uFlags |= NIF_ICON;
                 }
                 _ => {
-                    set_icon_data(icon_muted, &mut LABEL_NO_DEFAULT_DEVICE.encode_utf16());
-                    Ok(())
+                    notify_icon_data.hIcon = Default::default();
+                    notify_icon_data.uFlags &= !NIF_ICON;
                 }
+            });
+            notify_icon_data
+                .szTip
+                .iter_mut()
+                .zip(
+                    text.clone()
+                        .into_iter()
+                        .take(max_text_len)
+                        .chain(std::iter::repeat(0)),
+                )
+                .for_each(|(ptr, chr)| *ptr = chr);
+            if notify_icon_data.szTip[0] == 0 {
+                notify_icon_data.uFlags &= !(NIF_TIP | NIF_SHOWTIP);
+            } else {
+                notify_icon_data.uFlags |= NIF_TIP | NIF_SHOWTIP;
             }
+            Some(notify_icon_data)
         })
-    })
+    });
+
+    Ok(())
 }
 
 // Add the notify icon for when it does not already exists
 fn add_notify_icon() -> Result<()> {
     update_icon_data()?;
     NOTIFY_ICON_DATA.with(|global| {
-        let notify_icon_data = &*global.borrow();
-        unsafe {
-            Shell_NotifyIconW(NIM_ADD, notify_icon_data).ok()?;
-            Shell_NotifyIconW(NIM_SETVERSION, notify_icon_data).ok()?;
+        if let Some(notify_icon_data) = global.borrow().as_ref() {
+            unsafe {
+                Shell_NotifyIconW(NIM_ADD, notify_icon_data).ok()?;
+                Shell_NotifyIconW(NIM_SETVERSION, notify_icon_data).ok()?;
+            }
+            Ok(())
+        } else {
+            Ok(())
         }
-        Ok(())
     })
 }
 
@@ -648,11 +681,11 @@ fn add_notify_icon() -> Result<()> {
 fn update_notify_icon() -> Result<()> {
     update_icon_data()?;
     NOTIFY_ICON_DATA.with(|global| {
-        let notify_icon_data = &*global.borrow();
-        unsafe {
-            Shell_NotifyIconW(NIM_MODIFY, notify_icon_data).ok()?;
+        if let Some(notify_icon_data) = global.borrow().as_ref() {
+            unsafe { Shell_NotifyIconW(NIM_MODIFY, notify_icon_data).ok() }
+        } else {
+            Ok(())
         }
-        Ok(())
     })
 }
 
@@ -989,9 +1022,45 @@ extern "system" fn window_callback(
     }
 }
 
+#[derive(FromArgs)]
+/// Show the microphone mute status in the systray.
+struct CliArgs {
+    /// action: mute microphone
+    #[argh(switch)]
+    action_mute: bool,
+
+    /// action: unmute microphone
+    #[argh(switch)]
+    action_unmute: bool,
+
+    /// action: toggle microphone mute
+    #[argh(switch)]
+    action_toggle_mute: bool,
+
+    /// action: set recording volume to 100%
+    #[argh(switch)]
+    action_set_volume_to_max: bool,
+
+    /// action: exit immediately
+    #[argh(switch)]
+    action_exit: bool,
+}
+
 fn main() -> Result<()> {
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     assert!(instance.0 != 0);
+
+    // Attach to parent console so we can output help messages etc
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.or_else(|e| {
+        if e.code() == E_ACCESSDENIED {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })?;
+
+    // Parse CLI arguments
+    let args: CliArgs = argh::from_env();
 
     // Main window class definition
     let window_class_name_buffer = "MicrophoneMuteIndicator\0"
@@ -1061,24 +1130,44 @@ fn main() -> Result<()> {
     init_audio_endpoint()?;
     init_audio_endpoint_volume()?;
 
-    // Add the notify icon
-    let notify_icon_data = NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: window,
-        uID: 0,
-        uFlags: NIF_MESSAGE,
-        uCallbackMessage: WM_APP_NOTIFYICON,
-        Anonymous: NOTIFYICONDATAW_0 {
-            uVersion: NOTIFYICON_VERSION_4,
-        },
-        ..Default::default()
-    };
-    NOTIFY_ICON_DATA.with(|global| {
-        global.replace(notify_icon_data);
-    });
+    // Execute actions
+    if args.action_mute {
+        set_muted(true)?;
+    }
+    if args.action_unmute {
+        set_muted(false)?;
+    }
+    if args.action_toggle_mute {
+        toggle_mute()?;
+    }
+    if args.action_set_volume_to_max {
+        set_volume_to_max()?;
+    }
 
-    load_icons(instance)?;
-    add_notify_icon()?;
+    // Only add icon if we're not exiting immediately
+    let mut exit_result = Ok(());
+    if !args.action_exit {
+        // Add the notify icon
+        let notify_icon_data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: window,
+            uID: 0,
+            uFlags: NIF_MESSAGE,
+            uCallbackMessage: WM_APP_NOTIFYICON,
+            Anonymous: NOTIFYICONDATAW_0 {
+                uVersion: NOTIFYICON_VERSION_4,
+            },
+            ..Default::default()
+        };
+        NOTIFY_ICON_DATA.with(|global| {
+            global.replace(Some(notify_icon_data));
+        });
+
+        load_icons(instance)?;
+        add_notify_icon()?;
+    } else {
+        unsafe { DestroyWindow(window) }?;
+    }
 
     // Message pump
     let mut message = MSG::default();
@@ -1088,10 +1177,15 @@ fn main() -> Result<()> {
         }
     }
 
-    // Remove the notification icon
-    unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &notify_icon_data).ok()?;
+    if message.wParam.0 != 0 {
+        exit_result = Err(Error::from_win32())
     }
+
+    // Remove the notification icon
+    NOTIFY_ICON_DATA.with(|global| match global.replace(None) {
+        Some(notify_icon_data) => unsafe { Shell_NotifyIconW(NIM_DELETE, &notify_icon_data).ok() },
+        _ => Ok(()),
+    })?;
 
     // Release the COM objects
     deinit_audio_endpoint();
@@ -1139,9 +1233,5 @@ fn main() -> Result<()> {
         UnregisterClassW(window_class_name, instance)?;
     }
 
-    if message.wParam.0 == 0 {
-        Ok(())
-    } else {
-        Err(Error::from_win32())
-    }
+    exit_result
 }
