@@ -1130,13 +1130,7 @@ fn main() -> Result<()> {
     assert!(instance.0 != 0);
 
     // Attach to parent console so we can output help messages etc
-    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.or_else(|e| {
-        if e.code() == E_ACCESSDENIED {
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })?;
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.ok();
 
     // Parse CLI arguments
     let args: CliArgs = argh::from_env();
