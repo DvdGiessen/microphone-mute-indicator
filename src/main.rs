@@ -29,11 +29,14 @@ const WM_APP_CALLBACK_VOLUME: u32 = WM_APP + 3;
 
 const IDM_EXIT: u16 = 0u16.wrapping_sub(1);
 const IDM_OPEN_SOUNDCONTROLPANEL: u16 = 0u16.wrapping_sub(2);
-const IDM_SEPARATOR: u16 = 0u16.wrapping_sub(3);
-const IDM_NO_ENDPOINTS: u16 = 0u16.wrapping_sub(4);
+const IDM_SET_MAX_VOLUME: u16 = 0u16.wrapping_sub(3);
+const IDM_SEPARATOR: u16 = 0u16.wrapping_sub(4);
+const IDM_NO_ENDPOINTS: u16 = 0u16.wrapping_sub(5);
 
 const LABEL_EXIT: PCWSTR = w!("E&xit\0");
 const LABEL_OPEN_SOUNDCONTROLPANEL: PCWSTR = w!("Open Sound Control Panel\0");
+const LABEL_SET_MAX_VOLUME: PCWSTR = w!("Set recording volume to 100%\0");
+const LABEL_FORCE_MAX_VOLUME: &str = "Keeping recording volume at 100%";
 const LABEL_NO_CAPTURE_DEVICES: PCWSTR = w!("No audio capture devices found\0");
 const LABEL_NO_DEFAULT_DEVICE: &str = "No default communications audio capture device found!";
 const LABEL_MUTED: &str = "muted";
@@ -47,6 +50,9 @@ thread_local!(static AUDIO_POLICY_CONFIG: RefCell<Option<IPolicyConfig>> = const
 thread_local!(static AUDIO_ENDPOINT_ENUMERATOR: RefCell<Option<IMMDeviceEnumerator>> = const { RefCell::new(None) });
 thread_local!(static AUDIO_DEFAULT_ENDPOINT: RefCell<Option<IMMDevice>> = const { RefCell::new(None) });
 thread_local!(static AUDIO_DEFAULT_ENDPOINT_VOLUME: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) });
+
+// Volume configuration
+thread_local!(static CONFIG_FORCE_MAX_VOLUME: RefCell<bool> = const { RefCell::new(false) });
 
 // Icons for active and muted states
 thread_local!(static ICON_ACTIVE: RefCell<Option<HICON>> = const { RefCell::new(None) });
@@ -729,6 +735,37 @@ fn update_menu() -> Result<()> {
                                     IDM_SEPARATOR as usize,
                                     PCWSTR::null(),
                                 )?;
+                                CONFIG_FORCE_MAX_VOLUME.with(|force_max_volume| {
+                                    if *force_max_volume.borrow() {
+                                        let mut label_buffer = LABEL_FORCE_MAX_VOLUME
+                                            .to_string()
+                                            .encode_utf16()
+                                            .chain(std::iter::once(0))
+                                            .collect::<Vec<u16>>();
+                                        let label = PWSTR(label_buffer.as_mut_ptr());
+                                        InsertMenuItemW(
+                                            menu,
+                                            IDM_SET_MAX_VOLUME as u32,
+                                            false,
+                                            &MENUITEMINFOW {
+                                                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                                                fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING,
+                                                fType: MFT_STRING,
+                                                fState: MFS_CHECKED | MFS_DISABLED,
+                                                wID: IDM_SET_MAX_VOLUME as u32,
+                                                dwTypeData: label,
+                                                ..Default::default()
+                                            },
+                                        )
+                                    } else {
+                                        AppendMenuW(
+                                            menu,
+                                            MF_ENABLED | MF_STRING,
+                                            IDM_SET_MAX_VOLUME as usize,
+                                            LABEL_SET_MAX_VOLUME,
+                                        )
+                                    }
+                                })?;
                                 AppendMenuW(
                                     menu,
                                     MF_ENABLED | MF_STRING,
@@ -974,6 +1011,13 @@ extern "system" fn window_callback(
         WM_APP_CALLBACK_VOLUME => {
             // Audio endpoint volume/mute has changed
             update_notify_icon().ok();
+            CONFIG_FORCE_MAX_VOLUME.with(|global| {
+                if *global.borrow() {
+                    set_volume_to_max()
+                } else {
+                    Ok(())
+                }
+            }).ok();
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -983,7 +1027,10 @@ extern "system" fn window_callback(
                 },
                 IDM_OPEN_SOUNDCONTROLPANEL => {
                     open_sound_control_panel_recording_tab().ok();
-                }
+                },
+                IDM_SET_MAX_VOLUME => {
+                    set_volume_to_max().ok();
+                },
                 i => {
                     let i = i as usize;
                     MENU_AUDIO_ENDPOINTS.with(|global_menu_audio_endpoints| {
@@ -1025,6 +1072,10 @@ extern "system" fn window_callback(
 #[derive(FromArgs)]
 /// Show the microphone mute status in the systray.
 struct CliArgs {
+    /// config: force keep volume at 100%
+    #[argh(switch)]
+    config_force_keep_volume_at_max: bool,
+
     /// action: mute microphone
     #[argh(switch)]
     action_mute: bool,
@@ -1061,6 +1112,9 @@ fn main() -> Result<()> {
 
     // Parse CLI arguments
     let args: CliArgs = argh::from_env();
+
+    // Set configuration options
+    CONFIG_FORCE_MAX_VOLUME.with(|global| global.replace(args.config_force_keep_volume_at_max));
 
     // Main window class definition
     let window_class_name_buffer = "MicrophoneMuteIndicator\0"
