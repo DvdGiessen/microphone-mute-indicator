@@ -4,7 +4,8 @@
 #![windows_subsystem = "windows"]
 
 use argh::FromArgs;
-use std::{cell::RefCell, ffi::c_void};
+use std::{cell::RefCell, ffi::c_void, path::PathBuf};
+use strum_macros::EnumString;
 use windows::{
     core::*,
     Win32::{
@@ -42,6 +43,14 @@ const LABEL_NO_DEFAULT_DEVICE: &str = "No default communications audio capture d
 const LABEL_MUTED: &str = "muted";
 const LABEL_VOLUME_UNKNOWN: &str = "volume unknown";
 
+#[derive(Clone, Copy, EnumString, PartialEq)]
+#[strum(serialize_all = "snake_case")]
+enum IconTheme {
+    Auto,
+    Normal,
+    Inverted,
+}
+
 // Message received when the taskbar is (re)created
 thread_local!(static WM_TASKBAR_CREATED: RefCell<Option<u32>> = const { RefCell::new(None) });
 
@@ -53,6 +62,11 @@ thread_local!(static AUDIO_DEFAULT_ENDPOINT_VOLUME: RefCell<Option<IAudioEndpoin
 
 // Volume configuration
 thread_local!(static CONFIG_FORCE_MAX_VOLUME: RefCell<bool> = const { RefCell::new(false) });
+
+// Icon configuration
+thread_local!(static CONFIG_ICON_THEME: RefCell<IconTheme> = const { RefCell::new(IconTheme::Auto) });
+thread_local!(static CONFIG_ICON_ACTIVE: RefCell<(Option<Vec<u16>>, PCWSTR, u32, Option<IconTheme>)> = const { RefCell::new((None, w!("%SystemRoot%\\System32\\SndVolSSO.dll"), 141u32.wrapping_neg(), None)) });
+thread_local!(static CONFIG_ICON_MUTED: RefCell<(Option<Vec<u16>>, PCWSTR, u32, Option<IconTheme>)> = const { RefCell::new((None, w!("%SystemRoot%\\System32\\SndVolSSO.dll"), 140u32.wrapping_neg(), None)) });
 
 // Icons for active and muted states
 thread_local!(static ICON_ACTIVE: RefCell<Option<HICON>> = const { RefCell::new(None) });
@@ -497,36 +511,36 @@ fn invert_icon(icon: HICON) -> Result<HICON> {
     }
 }
 
+// Load an icon and invert it if required
+fn load_icon(instance: HINSTANCE, path: PCWSTR, index: u32, theme: Option<IconTheme>) -> Result<(HICON, HICON)> {
+    let icon = unsafe {
+        ExtractIconW(
+            instance,
+            path,
+            index,
+        )
+    };
+    assert!(!icon.is_invalid(), "Icon is not valid.");
+    let icon_inverted = invert_icon(icon)?;
+    assert!(!icon_inverted.is_invalid(), "Inverted icon is not valid.");
+    Ok(match theme.unwrap_or(CONFIG_ICON_THEME.with(|global| *global.borrow())) {
+        IconTheme::Auto => (icon, icon_inverted),
+        IconTheme::Normal => (icon, icon),
+        IconTheme::Inverted => (icon_inverted, icon_inverted),
+    })
+}
+
 // Load the icons to use from the icon file
 fn load_icons(instance: HINSTANCE) -> Result<()> {
     // Load the icons
-    let icon_active = unsafe {
-        ExtractIconW(
-            instance,
-            w!("%SystemRoot%\\System32\\SndVolSSO.dll"),
-            141u32.wrapping_neg(),
-        )
-    };
-    let icon_active_inverted = invert_icon(icon_active)?;
-    let icon_muted = unsafe {
-        ExtractIconW(
-            instance,
-            w!("%SystemRoot%\\System32\\SndVolSSO.dll"),
-            140u32.wrapping_neg(),
-        )
-    };
-    let icon_muted_inverted = invert_icon(icon_muted)?;
-
-    assert!(!icon_active.is_invalid(), "Active icon is not valid.");
-    assert!(
-        !icon_active_inverted.is_invalid(),
-        "Active inverted icon is not valid."
-    );
-    assert!(!icon_muted.is_invalid(), "Muted icon is not valid.");
-    assert!(
-        !icon_muted_inverted.is_invalid(),
-        "Muted inverted icon is not valid."
-    );
+    let (icon_active, icon_active_inverted) = CONFIG_ICON_ACTIVE.with(|global| {
+        let (_, path, index, theme) = &*global.borrow();
+        load_icon(instance, *path, *index, *theme)
+    })?;
+    let (icon_muted, icon_muted_inverted) = CONFIG_ICON_MUTED.with(|global| {
+        let (_, path, index, theme) = &*global.borrow();
+        load_icon(instance, *path, *index, *theme)
+    })?;
 
     // Replace currently loaded icons
     ICON_ACTIVE.with(|global| match global.replace(Some(icon_active)) {
@@ -1076,6 +1090,18 @@ struct CliArgs {
     #[argh(switch)]
     config_force_keep_volume_at_max: bool,
 
+    /// config: icon theme selection
+    #[argh(option)]
+    config_icon_theme: Option<IconTheme>,
+
+    /// config: custom icon when not muted
+    #[argh(option)]
+    config_icon_active: Option<PathBuf>,
+
+    /// config: custom icon when muted
+    #[argh(option)]
+    config_icon_muted: Option<PathBuf>,
+
     /// action: mute microphone
     #[argh(switch)]
     action_mute: bool,
@@ -1097,6 +1123,8 @@ struct CliArgs {
     action_exit: bool,
 }
 
+use std::os::windows::ffi::OsStrExt;
+
 fn main() -> Result<()> {
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     assert!(instance.0 != 0);
@@ -1115,7 +1143,29 @@ fn main() -> Result<()> {
 
     // Set configuration options
     CONFIG_FORCE_MAX_VOLUME.with(|global| global.replace(args.config_force_keep_volume_at_max));
-
+    if let Some(icon_theme) = args.config_icon_theme {
+        CONFIG_ICON_THEME.with(|global| global.replace(icon_theme));
+    }
+    let custom_icon_theme = args.config_icon_theme.or(Some(IconTheme::Normal));
+    if let Some(icon_active) = args.config_icon_active {
+        let path_buffer = icon_active
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let path = PCWSTR(path_buffer.as_ptr());
+        CONFIG_ICON_ACTIVE.with(|global| global.replace((Some(path_buffer), path, 0, custom_icon_theme)));
+    }
+    if let Some(icon_muted) = args.config_icon_muted {
+        let path_buffer = icon_muted
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let path = PCWSTR(path_buffer.as_ptr());
+        CONFIG_ICON_MUTED.with(|global| global.replace((Some(path_buffer), path, 0, custom_icon_theme)));
+    }
+    
     // Main window class definition
     let window_class_name_buffer = "MicrophoneMuteIndicator\0"
         .encode_utf16()
