@@ -91,7 +91,7 @@ struct AudioEndpointCallback {
 }
 
 #[allow(non_snake_case)]
-impl IMMNotificationClient_Impl for AudioEndpointCallback {
+impl IMMNotificationClient_Impl for AudioEndpointCallback_Impl {
     fn OnDeviceStateChanged(
         &self,
         _pwstrdeviceid: &PCWSTR,
@@ -124,7 +124,7 @@ struct AudioEndpointVolumeCallback {
 }
 
 #[allow(non_snake_case)]
-impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback {
+impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback_Impl {
     fn OnNotify(&self, _pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
         unsafe { PostMessageW(self.window, WM_APP_CALLBACK_VOLUME, WPARAM(0), LPARAM(0)) }
     }
@@ -512,22 +512,23 @@ fn invert_icon(icon: HICON) -> Result<HICON> {
 }
 
 // Load an icon and invert it if required
-fn load_icon(instance: HINSTANCE, path: PCWSTR, index: u32, theme: Option<IconTheme>) -> Result<(HICON, HICON)> {
-    let icon = unsafe {
-        ExtractIconW(
-            instance,
-            path,
-            index,
-        )
-    };
+fn load_icon(
+    instance: HINSTANCE,
+    path: PCWSTR,
+    index: u32,
+    theme: Option<IconTheme>,
+) -> Result<(HICON, HICON)> {
+    let icon = unsafe { ExtractIconW(instance, path, index) };
     assert!(!icon.is_invalid(), "Icon is not valid.");
     let icon_inverted = invert_icon(icon)?;
     assert!(!icon_inverted.is_invalid(), "Inverted icon is not valid.");
-    Ok(match theme.unwrap_or(CONFIG_ICON_THEME.with(|global| *global.borrow())) {
-        IconTheme::Auto => (icon, icon_inverted),
-        IconTheme::Normal => (icon, icon),
-        IconTheme::Inverted => (icon_inverted, icon_inverted),
-    })
+    Ok(
+        match theme.unwrap_or(CONFIG_ICON_THEME.with(|global| *global.borrow())) {
+            IconTheme::Auto => (icon, icon_inverted),
+            IconTheme::Normal => (icon, icon),
+            IconTheme::Inverted => (icon_inverted, icon_inverted),
+        },
+    )
 }
 
 // Load the icons to use from the icon file
@@ -763,7 +764,10 @@ fn update_menu() -> Result<()> {
                                             false,
                                             &MENUITEMINFOW {
                                                 cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                                                fMask: MIIM_FTYPE | MIIM_ID | MIIM_STATE | MIIM_STRING,
+                                                fMask: MIIM_FTYPE
+                                                    | MIIM_ID
+                                                    | MIIM_STATE
+                                                    | MIIM_STRING,
                                                 fType: MFT_STRING,
                                                 fState: MFS_CHECKED | MFS_DISABLED,
                                                 wID: IDM_SET_MAX_VOLUME as u32,
@@ -986,7 +990,7 @@ extern "system" fn window_callback(
         }
         WM_DPICHANGED => {
             let instance: HINSTANCE = unsafe { GetModuleHandleW(None).unwrap().into() };
-            assert!(instance.0 != 0);
+            assert!(!instance.is_invalid());
             load_icons(instance).unwrap();
             update_notify_icon().ok();
             LRESULT(0)
@@ -1025,13 +1029,15 @@ extern "system" fn window_callback(
         WM_APP_CALLBACK_VOLUME => {
             // Audio endpoint volume/mute has changed
             update_notify_icon().ok();
-            CONFIG_FORCE_MAX_VOLUME.with(|global| {
-                if *global.borrow() {
-                    set_volume_to_max()
-                } else {
-                    Ok(())
-                }
-            }).ok();
+            CONFIG_FORCE_MAX_VOLUME
+                .with(|global| {
+                    if *global.borrow() {
+                        set_volume_to_max()
+                    } else {
+                        Ok(())
+                    }
+                })
+                .ok();
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -1041,10 +1047,10 @@ extern "system" fn window_callback(
                 },
                 IDM_OPEN_SOUNDCONTROLPANEL => {
                     open_sound_control_panel_recording_tab().ok();
-                },
+                }
                 IDM_SET_MAX_VOLUME => {
                     set_volume_to_max().ok();
-                },
+                }
                 i => {
                     let i = i as usize;
                     MENU_AUDIO_ENDPOINTS.with(|global_menu_audio_endpoints| {
@@ -1127,7 +1133,7 @@ use std::os::windows::ffi::OsStrExt;
 
 fn main() -> Result<()> {
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
-    assert!(instance.0 != 0);
+    assert!(!instance.is_invalid());
 
     // Attach to parent console so we can output help messages etc
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.ok();
@@ -1148,7 +1154,8 @@ fn main() -> Result<()> {
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         let path = PCWSTR(path_buffer.as_ptr());
-        CONFIG_ICON_ACTIVE.with(|global| global.replace((Some(path_buffer), path, 0, custom_icon_theme)));
+        CONFIG_ICON_ACTIVE
+            .with(|global| global.replace((Some(path_buffer), path, 0, custom_icon_theme)));
     }
     if let Some(icon_muted) = args.config_icon_muted {
         let path_buffer = icon_muted
@@ -1157,9 +1164,10 @@ fn main() -> Result<()> {
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         let path = PCWSTR(path_buffer.as_ptr());
-        CONFIG_ICON_MUTED.with(|global| global.replace((Some(path_buffer), path, 0, custom_icon_theme)));
+        CONFIG_ICON_MUTED
+            .with(|global| global.replace((Some(path_buffer), path, 0, custom_icon_theme)));
     }
-    
+
     // Main window class definition
     let window_class_name_buffer = "MicrophoneMuteIndicator\0"
         .encode_utf16()
@@ -1192,8 +1200,8 @@ fn main() -> Result<()> {
             instance,
             None,
         )
-    };
-    assert!(window.0 != 0);
+    }?;
+    assert!(!window.is_invalid());
 
     // Initialize COM runtime
     unsafe {
@@ -1269,7 +1277,7 @@ fn main() -> Result<()> {
 
     // Message pump
     let mut message = MSG::default();
-    while unsafe { GetMessageW(&mut message, HWND(0), 0, 0) }.into() {
+    while unsafe { GetMessageW(&mut message, HWND(std::ptr::null_mut()), 0, 0) }.into() {
         unsafe {
             DispatchMessageW(&message);
         }

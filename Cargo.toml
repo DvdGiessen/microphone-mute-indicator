@@ -5,16 +5,16 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
-strum = "0.26.2"
-strum_macros = "0.26.2"
-windows-core = { version = "0.56.0" }
+strum = "0.26.3"
+strum_macros = "0.26.4"
+windows-core = { version = "0.58.0" }
 
 [dependencies.argh]
 version = "0.1.12"
 default-features = false
 
 [dependencies.windows]
-version = "0.56.0"
+version = "0.58.0"
 features = [
     "implement",
     "Win32_Devices_FunctionDiscovery",
