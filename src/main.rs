@@ -1007,8 +1007,8 @@ extern "system" fn window_callback(
             WM_CONTEXTMENU => {
                 show_menu(
                     window,
-                    wparam.0 as i32 & 0xffff,
-                    (wparam.0 as i32 >> 16) & 0xffff,
+                    (wparam.0 as u32 & 0xffff) as i16 as i32,
+                    ((wparam.0 as u32 >> 16) & 0xffff) as i16 as i32,
                 )
                 .unwrap();
                 LRESULT(0)
